@@ -1,0 +1,44 @@
+#!/bin/bash
+export OMP_NUM_THREADS=8
+export CUDA_LAUNCH_BLOCKING=1
+export WANDB_DISABLED=false
+export TOKENIZERS_PARALLELISM=false
+export LOCAL_RANK=0
+export WANDB_PROJECT="fabric_test"
+export WANDB_ENTITY="tadev"
+export WANDB_NAME="[bart]test"
+export HUGGINGFACE_HUB_CACHE="./.cache"
+export HF_DATASETS_CACHE="./.cache"
+
+CUDA_VISIBLE_DEVICES=$GPU_IDS \
+deepspeed --include localhost:2,3 --master_port 61000 ./train.py \
+    --vision_model="" \
+    --text_model="" \
+    --output_dir="model_outputs/" \
+    --train_datasets_path="" \
+    --eval_datasets_path="" \
+    --seed=42 \
+    --num_workers=12 \
+    --per_device_train_batch_size=64 \
+    --per_device_eval_batch_size=64 \
+    --val_check_interval=0.25 \
+    --accumulate_grad_batches=1 \
+    --max_epochs=3 \
+    --log_every_n_steps=1 \
+    --accelerator=gpu \
+    --strategy=deepspeed \
+    --num_nodes=1 \
+    --replace_sampler_ddp=false \
+    --devices=4 \
+    --auto_select_gpus=true \
+    --auto_scale_batch_size=false \
+    --learning_rate=0.00005 \
+    --max_lr=0.0001 \
+    --weight_decay=0.0001 \
+    --warmup_ratio=0.2 \
+    --ratio=0.2 \
+    --div_factor=10 \
+    --final_div_factor=10 \
+    --valid_on_cpu=false \
+    --truncated_bptt_steps=2 \
+    --deepspeed_config=ds_config/zero2.json
