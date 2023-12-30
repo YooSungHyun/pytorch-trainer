@@ -16,7 +16,7 @@ from torch.utils.data import random_split, DistributedSampler, RandomSampler, Se
 from utils.comfy import dataclass_to_namespace, seed_everything
 from cpu_trainer import Trainer
 import logging
-from logging.handlers import TimedRotatingFileHandler
+from logging import StreamHandler
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import wandb
@@ -27,7 +27,7 @@ formatter = logging.Formatter("%(asctime)s [%(levelname)8s] %(message)s")
 
 log_file_name = "./logs/output.log"
 
-timeFileHandler = TimedRotatingFileHandler(filename=log_file_name, when="midnight", interval=1, encoding="utf-8")
+timeFileHandler = StreamHandler()
 timeFileHandler.setFormatter(formatter)
 
 logger.addHandler(timeFileHandler)
