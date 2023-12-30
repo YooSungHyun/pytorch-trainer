@@ -35,6 +35,7 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 -   [x] cpu_trainer - wandb
 -   [x] cpu_trainer - continuous learning
 -   [ ] cpu_trainer - weird lstm training fix
+-   [ ] cpu_trainer = add fp16 and bf16 use
 -   [ ] ddp_trainer - lstm or mnist example
 -   [ ] ddp_trainer - sampler and dataloader
 -   [ ] ddp_trainer - training loop additional process?(for distributed learning)
