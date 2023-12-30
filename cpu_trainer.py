@@ -4,15 +4,19 @@ from functools import partial
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
 
 import torch
-from utils.comfy import apply_to_collection
+from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint
 from tqdm import tqdm
+
+precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 class Trainer:
     def __init__(
         self,
+        total_global_step: int,
         precision="fp32",
-        loggers=None,
+        cmd_logger=None,
+        web_logger=None,
         max_epochs: Optional[int] = 1000,
         max_steps: Optional[int] = None,
         grad_accum_steps: int = 1,
@@ -22,6 +26,7 @@ class Trainer:
         use_distributed_sampler: bool = True,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
+        chk_addr_dict: dict = None,
     ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
@@ -49,8 +54,20 @@ class Trainer:
             callbacks written for the lightning trainer (especially making assumptions on the trainer), won't work!
 
         """
+        if precision in ["fp16", "float16"]:
+            self.precision = precision_dict["fp16"]
+        elif precision in ["bf16" or "bfloat16"]:
+            self.precision = precision_dict["bf16"]
+        else:
+            self.precision = precision_dict["fp32"]
+
+        self.logger = cmd_logger
+        self.web_logger = web_logger
+        self.chk_addr_dict = chk_addr_dict
 
         self.global_step = 0
+        self.step = 0
+        self.total_global_step = total_global_step
         self.grad_accum_steps: int = grad_accum_steps
         self.current_epoch = 0
 
@@ -83,6 +100,7 @@ class Trainer:
         criterion,
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
+        trainable_loss=None,
         ckpt_path: Optional[str] = None,
     ):
         """The main entrypoint of the trainer, triggering the actual training.
@@ -97,46 +115,39 @@ class Trainer:
                 If specified, will always look for the latest checkpoint within the given directory.
 
         """
-        self.fabric.launch()
-
-        # setup dataloaders
-        train_loader = self.fabric.setup_dataloaders(
-            train_loader, use_distributed_sampler=self.use_distributed_sampler
-        )
-        if val_loader is not None:
-            val_loader = self.fabric.setup_dataloaders(
-                val_loader, use_distributed_sampler=self.use_distributed_sampler
-            )
-
-        # optimizer, scheduler_cfg = self._parse_optimizers_schedulers(model.configure_optimizers())
-        assert optimizer is not None
-        model, optimizer = self.fabric.setup(model, optimizer)
-
         # assemble state (current epoch and global step will be added in save)
-        state = {"model": model, "optim": optimizer, "scheduler_cfg": scheduler_cfg}
+        state = {
+            "model": model,
+            "optimizer": optimizer,
+            "scheduler_cfg": scheduler_cfg,
+            "trainable_loss": trainable_loss,
+        }
+
         # load last checkpoint if available
         if ckpt_path is not None and os.path.isdir(ckpt_path):
             latest_checkpoint_path = self.get_latest_checkpoint(self.checkpoint_dir)
             if latest_checkpoint_path is not None:
-                self.load(state, latest_checkpoint_path)
-
+                state.update(self.load(state, latest_checkpoint_path))
                 # check if we even need to train here
                 if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
                     self.should_stop = True
+
         self.criterion = criterion
         while not self.should_stop:
             self.train_loop(
-                model,
-                optimizer,
-                scheduler_cfg=scheduler_cfg,
+                state["model"],
+                state["optimizer"],
+                scheduler_cfg=state["scheduler_cfg"],
                 train_loader=train_loader,
                 limit_batches=self.limit_train_batches,
             )
 
             if self.should_validate:
-                self.val_loop(model, val_loader, limit_batches=self.limit_val_batches)
+                self.val_loop(state["model"], val_loader, limit_batches=self.limit_val_batches)
 
-            self.step_scheduler(model, scheduler_cfg, level="epoch", current_value=self.current_epoch)
+            self.step_scheduler(
+                state["model"], state["scheduler_cfg"], level="epoch", current_value=self.current_epoch
+            )
 
             self.current_epoch += 1
 
@@ -156,6 +167,7 @@ class Trainer:
         scheduler_cfg: Optional[Mapping],
         train_loader: torch.utils.data.DataLoader,
         limit_batches: Union[int, float] = float("inf"),
+        trainable_loss=None,
     ):
         """The training loop running a single training epoch.
 
@@ -176,7 +188,7 @@ class Trainer:
 
         on_train_epoch_start()
         iterable = self.progbar_wrapper(
-            train_loader, total=min(len(train_loader), limit_batches), desc=f"Epoch {self.current_epoch}"
+            train_loader, total=min(self.total_global_step, limit_batches), desc=f"Epoch {self.current_epoch}"
         )
 
         for batch_idx, batch in enumerate(iterable):
@@ -270,7 +282,7 @@ class Trainer:
             def on_validation_batch_start(batch, batch_idx):
                 pass
 
-            on_validation_batch_start()
+            on_validation_batch_start(batch, batch_idx)
             inputs, labels = batch
             outputs = model(inputs)
             loss = self.criterion(outputs, labels)
@@ -287,8 +299,8 @@ class Trainer:
             self._format_iterable(iterable, self._current_val_return, "val")
 
         def on_validation_epoch_end():
-            self.fabric.log(
-                name="val_loss", value=self._current_val_return["loss"], step=batch_idx * self.current_epoch
+            self.logger.info(
+                f"val_loss: {self._current_val_return['loss']:.20f}, step: {batch_idx * self.current_epoch}"
             )
 
         on_validation_epoch_end()
@@ -317,7 +329,8 @@ class Trainer:
             pass
 
         on_before_backward(loss)
-        self.fabric.backward(loss)
+        loss.backward()
+        self.step += 1
 
         def on_after_backward():
             pass
@@ -327,9 +340,7 @@ class Trainer:
         outputs = {"loss": loss}
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
-        self.fabric.log(
-            name="train_loss", value=self._current_train_return["loss"], step=batch_idx * self.current_epoch
-        )
+        self.logger.info(f"train_loss: {self._current_train_return['loss']:.20f}, step: {self.step}")
         return loss
 
     def step_scheduler(
@@ -401,9 +412,8 @@ class Trainer:
             total: the total length of the iterable, necessary in case the number of batches was limited.
 
         """
-        if self.fabric.is_global_zero:
-            return tqdm(iterable, total=total, **kwargs)
-        return iterable
+        # in cpu, it just one
+        return tqdm(iterable, total=total, **kwargs)
 
     def load(self, state: Optional[Mapping], path: str) -> None:
         """Loads a checkpoint from a given file into state.
@@ -416,12 +426,15 @@ class Trainer:
         if state is None:
             state = {}
 
-        remainder = self.fabric.load(path, state)
-        self.global_step = remainder.pop("global_step")
-        self.current_epoch = remainder.pop("current_epoch")
+        load_checkpoint(state, checkpoint_filepath=path, logger=self.logger)
+        self.global_step = state.pop("global_step")
+        self.step = state.pop("step")
+        self.current_epoch = state.pop("current_epoch")
 
-        if remainder:
-            raise RuntimeError(f"Unused Checkpoint Values: {remainder}")
+        if state:
+            self.logger.info(f"Unused Checkpoint Values: {state}, returned")
+
+        return state
 
     def save(self, state: Optional[Mapping]) -> None:
         """Saves a checkpoint to the ``checkpoint_dir``
@@ -433,9 +446,13 @@ class Trainer:
         if state is None:
             state = {}
 
-        state.update(global_step=self.global_step, current_epoch=self.current_epoch)
-
-        self.fabric.save(os.path.join(self.checkpoint_dir, f"epoch-{self.current_epoch:04d}.ckpt"), state)
+        state.update(global_step=self.global_step, current_epoch=self.current_epoch, step=self.step)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        save_checkpoint(
+            **state,
+            checkpoint_filepath=os.path.join(self.checkpoint_dir, f"epoch-{self.current_epoch:04d}.ckpt"),
+            logger=self.logger,
+        )
 
     @staticmethod
     def get_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
@@ -471,10 +488,10 @@ class Trainer:
             postfix_str = ""
             float_candidates = apply_to_collection(candidates, torch.Tensor, lambda x: x.item())
             if isinstance(candidates, torch.Tensor):
-                postfix_str += f" {prefix}_loss: {float_candidates:.3f}"
+                postfix_str += f" {prefix}_loss: {float_candidates:.20f}"
             elif isinstance(candidates, Mapping):
                 for k, v in float_candidates.items():
-                    postfix_str += f" {prefix}_{k}: {v:.3f}"
+                    postfix_str += f" {prefix}_{k}: {v:.20f}"
 
             if postfix_str:
                 prog_bar.set_postfix_str(postfix_str)

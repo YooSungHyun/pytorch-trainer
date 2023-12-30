@@ -14,17 +14,12 @@ class CustomDataLoader(torch.utils.data.DataLoader):
 
     def _collate_fn(self, batch):
         # make pad or something work for each step's batch
-        inputs = None
-        labels = None
+        inputs = list()
+        labels = list()
         for i in range(len(batch)):
             for key in self.key_to_inputs:
-                if inputs is None:
-                    inputs = torch.FloatTensor(batch[i][key])
-                else:
-                    inputs = torch.stack([inputs, torch.FloatTensor(batch[i][key])], dim=0)
+                inputs.append(torch.FloatTensor(batch[i][key]))
             for key in self.key_to_labels:
-                if labels is None:
-                    labels = torch.FloatTensor(batch[i][key])
-                else:
-                    labels = torch.stack([labels, torch.FloatTensor(batch[i][key])], dim=0)
-        return inputs, labels
+                labels.append(torch.FloatTensor(batch[i][key]))
+
+        return torch.stack(inputs), torch.stack(labels)

@@ -42,7 +42,6 @@ def main(hparams: TrainingArguments):
     # 7일간의 데이터가 입력으로 들어가고 batch size는 임의로 지정
     seq_length = 7
 
-    # 데이터를 역순으로 정렬하여 전체 데이터의 70% 학습, 30% 테스트에 사용
     train_df = train_df[::-1]
     train_size = int(len(train_df) * 0.7)
     train_set = train_df[0:train_size]
@@ -102,7 +101,7 @@ def main(hparams: TrainingArguments):
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=hparams.learning_rate,
-        eps=hparams.adam_eps,
+        eps=hparams.optim_eps,
         betas=(hparams.optim_beta1, hparams.optim_beta2),
         weight_decay=hparams.weight_decay,
     )
@@ -126,7 +125,8 @@ def main(hparams: TrainingArguments):
         key_to_labels=["labels"],
         batch_size=hparams.per_device_train_batch_size,
         num_workers=hparams.num_workers,
-        sampler=custom_train_sampler,
+        drop_last=True,
+        shuffle=True,
     )
     eval_dataloader = CustomDataLoader(
         dataset=eval_dataset,
@@ -134,7 +134,8 @@ def main(hparams: TrainingArguments):
         key_to_labels=["labels"],
         batch_size=hparams.per_device_eval_batch_size,
         num_workers=hparams.num_workers,
-        sampler=custom_eval_sampler,
+        drop_last=True,
+        shuffle=True,
     )
 
     steps_per_epoch = math.ceil(len(train_dataloader) // (1 * hparams.accumulate_grad_batches))
@@ -147,8 +148,43 @@ def main(hparams: TrainingArguments):
         steps_per_epoch=steps_per_epoch,
     )
     lr_scheduler = {"interval": "step", "scheduler": scheduler, "name": "AdamW", "frequency": 1, "monitor": None}
+    assert id(scheduler) == id(lr_scheduler["scheduler"])
     criterion = torch.nn.MSELoss()
-    trainer = Trainer(max_epochs=hparams.max_epochs, grad_accum_steps=hparams.accumulate_grad_batches)
+    trainable_loss = None
+
+    # I think some addr is same into trainer init&fit respectfully
+    chk_addr_dict = {
+        "train_dataloader": id(train_dataloader),
+        "eval_dataloader": id(eval_dataloader),
+        "model": id(model),
+        "optimizer": id(optimizer),
+        "criterion": id(criterion),
+        "scheduler_cfg": id(lr_scheduler),
+        "scheduler_cfg[scheduler]": id(lr_scheduler["scheduler"]),
+        "trainable_loss": id(trainable_loss),
+    }
+
+    log_str = f"""##########################################
+    train_dataloader addr: {chk_addr_dict["train_dataloader"]}
+    eval_dataloader addr: {chk_addr_dict["eval_dataloader"]}
+    model addr: {chk_addr_dict["model"]}
+    optimizer addr: {chk_addr_dict["optimizer"]}
+    criterion addr: {chk_addr_dict["criterion"]}
+    scheduler_cfg addr: {chk_addr_dict["scheduler_cfg"]}
+    scheduler addr: {chk_addr_dict["scheduler_cfg[scheduler]"]}
+    ##########################################
+    """
+    logger.info(log_str)
+
+    trainer = Trainer(
+        cmd_logger=logger,
+        max_epochs=hparams.max_epochs,
+        grad_accum_steps=hparams.accumulate_grad_batches,
+        total_global_step=steps_per_epoch,
+        chk_addr_dict=chk_addr_dict,
+        checkpoint_dir=hparams.output_dir,
+    )
+
     trainer.fit(
         model=model,
         optimizer=optimizer,
@@ -157,6 +193,7 @@ def main(hparams: TrainingArguments):
         train_loader=train_dataloader,
         val_loader=eval_dataloader,
         ckpt_path=hparams.output_dir,
+        trainable_loss=trainable_loss,
     )
 
 
