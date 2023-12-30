@@ -30,10 +30,10 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 
 # TODO LIST
 
--   [x] cpu_trainer - lstm example, but it training is weired
+-   [x] cpu_trainer - lstm example, but it training is weird
 -   [x] cpu_trainer - wandb
 -   [x] cpu_trainer - continuous learning
--   [ ] cpu_trainer - weired lstm training fix
+-   [ ] cpu_trainer - weird lstm training fix
 -   [ ] ddp_trainer - lstm or mnist example
 -   [ ] ddp_trainer - sampler and dataloader
 -   [ ] ddp_trainer - training loop additional process?(for distributed learning)
