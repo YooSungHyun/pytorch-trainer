@@ -7,8 +7,8 @@ Write my own trainer in pure native torch.
 
 Each trainer will be written in its own python file.
 
->   torch >= 2.1.2
->   cuda 11.8
+>   torch >= 2.1.2</br>
+>   cuda 11.8</br>
 >   I am experimenting with codebase deepspeed as of 231230.
 
 deepspeed install is,
@@ -18,6 +18,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 After executing the command, **restart the terminal** to install deepspeed.
+
 **Make sure you have 11.8 CUDA and the corresponding TORCH installed,**
 
 ```bash
@@ -49,6 +50,7 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 # Unsupported list
 
 **tensorboard** - I personally find it too inconvenient.
+
 fsdp - deepspeed is more comfortable for me... ( **I'll consider this if I get more requests**).
 
 # plz help!!!
