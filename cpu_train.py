@@ -25,8 +25,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s [%(levelname)8s] %(message)s")
 
-log_file_name = "./logs/output.log"
-
 timeFileHandler = StreamHandler()
 timeFileHandler.setFormatter(formatter)
 
@@ -40,7 +38,7 @@ def main(hparams: TrainingArguments):
     os.makedirs(hparams.output_dir, exist_ok=True)
 
     train_df = pd.read_csv(hparams.train_datasets_path, encoding="utf-8")
-    # 7일간의 데이터가 입력으로 들어가고 batch size는 임의로 지정
+    # 7 day gap
     seq_length = 7
 
     train_df = train_df[::-1]
@@ -62,7 +60,7 @@ def main(hparams: TrainingArguments):
     train_set.iloc[:, -1] = scaler_y.transform(train_set.iloc[:, [-1]])
     test_set.iloc[:, -1] = scaler_y.transform(test_set.iloc[:, [-1]])
 
-    # 데이터셋 생성 함수
+    # quick example use
     def build_dataset(time_series, seq_length):
         dataX = []
         dataY = []
@@ -148,7 +146,8 @@ def main(hparams: TrainingArguments):
         final_div_factor=hparams.final_div_factor,
         steps_per_epoch=steps_per_epoch,
     )
-    lr_scheduler = {"interval": "step", "scheduler": scheduler, "name": "AdamW", "frequency": 1, "monitor": None}
+    # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
+    lr_scheduler = {"scheduler": scheduler, "frequency": 1, "monitor": None}
     assert id(scheduler) == id(lr_scheduler["scheduler"])
     criterion = torch.nn.MSELoss()
     trainable_loss = None

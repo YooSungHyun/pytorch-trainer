@@ -32,8 +32,7 @@ class Trainer:
         featureset. As a trainer with more included features, we recommend using the
 
         Args:
-            precision: Double precision (``"64"``), full precision (``"32"``), half precision AMP (``"16-mixed"``),
-                or bfloat16 precision AMP (``"bf16-mixed"``).
+            precision: fp16, bf16, fp32
 
             loggers: A single logger or a list of loggers.
 
@@ -49,9 +48,6 @@ class Trainer:
                 in case of distributed training.
             checkpoint_dir: Directory to store checkpoints to.
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
-
-        Warning:
-            callbacks written for the lightning trainer (especially making assumptions on the trainer), won't work!
 
         """
         if precision in ["fp16", "float16"]:
@@ -107,8 +103,7 @@ class Trainer:
         """The main entrypoint of the trainer, triggering the actual training.
 
         Args:
-            model: the LightningModule to train.
-                Can have the same hooks as :attr:`callbacks` (see :meth:`MyCustomTrainer.__init__`).
+            model: model
             train_loader: the training dataloader. Has to be an iterable returning batches.
             val_loader: the validation dataloader. Has to be an iterable returning batches.
                 If not specified, no validation will run.
@@ -174,15 +169,12 @@ class Trainer:
         """The training loop running a single training epoch.
 
         Args:
-            model: the LightningModule to train
-            optimizer: the optimizer, optimizing the LightningModule.
+            model: model to train
+            optimizer: the optimizer
             train_loader: The dataloader yielding the training batches.
             limit_batches: Limits the batches during this training epoch.
                 If greater than the number of batches in the ``train_loader``, this has no effect.
             scheduler_cfg: The learning rate scheduler configuration.
-                Have a look at :meth:`~lightning.pytorch.core.LightningModule.configure_optimizers`
-                for supported values.
-
         """
 
         def on_train_epoch_start():
@@ -276,7 +268,7 @@ class Trainer:
         """The validation loop ruunning a single validation epoch.
 
         Args:
-            model: the LightningModule to evaluate
+            model: model
             val_loader: The dataloader yielding the validation batches.
             limit_batches: Limits the batches during this validation epoch.
                 If greater than the number of batches in the ``val_loader``, this has no effect.
@@ -348,7 +340,7 @@ class Trainer:
         given as a closure to the optimizer step.
 
         Args:
-            model: the lightning module to train
+            model: model to train
             batch: the batch to run the forward on
             batch_idx: index of the current batch w.r.t the current epoch
 
@@ -391,7 +383,6 @@ class Trainer:
 
         Args:
             scheduler_cfg: The learning rate scheduler configuration.
-                Have a look at :meth:`lightning.pytorch.LightningModule.configure_optimizers` for supported values.
             level: whether we are trying to step on epoch- or step-level
             current_value: Holds the current_epoch if ``level==epoch``, else holds the ``global_step``
 
