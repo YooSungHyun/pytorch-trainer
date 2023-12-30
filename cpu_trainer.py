@@ -2,7 +2,7 @@ import os
 from collections.abc import Mapping
 from functools import partial
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
-
+import time
 import torch
 from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint
 from tqdm import tqdm
@@ -102,6 +102,7 @@ class Trainer:
         val_loader: torch.utils.data.DataLoader,
         trainable_loss=None,
         ckpt_path: Optional[str] = None,
+        wandb_upload_wait: int = 0,
     ):
         """The main entrypoint of the trainer, triggering the actual training.
 
@@ -145,9 +146,7 @@ class Trainer:
             if self.should_validate:
                 self.val_loop(state["model"], val_loader, limit_batches=self.limit_val_batches)
 
-            self.step_scheduler(
-                state["model"], state["scheduler_cfg"], level="epoch", current_value=self.current_epoch
-            )
+            self.step_scheduler(state["scheduler_cfg"], level="epoch", current_value=self.current_epoch)
 
             self.current_epoch += 1
 
@@ -159,6 +158,9 @@ class Trainer:
 
         # reset for next fit call
         self.should_stop = False
+        # train is completed super fast, it can not upload final epoch's sometings
+        # so wait small second
+        time.sleep(wandb_upload_wait)
 
     def train_loop(
         self,
@@ -202,6 +204,7 @@ class Trainer:
             on_train_batch_start(batch, batch_idx)
             # check if optimizer should step in gradient accumulation
             should_optim_step = self.global_step % self.grad_accum_steps == 0
+            global_loss = 0
             if should_optim_step:
                 # currently only supports a single optimizer
                 def on_before_optimizer_step(optimizer, opt_idx):
@@ -209,7 +212,17 @@ class Trainer:
 
                 on_before_optimizer_step(optimizer, 0)
                 # optimizer step runs train step internally through closure
-                self.training_step(model=model, batch=batch, batch_idx=batch_idx)
+                loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
+                global_loss += loss
+                mean_global_loss = global_loss / self.grad_accum_steps
+                self.web_logger.log(
+                    {
+                        "train/global_step_loss": mean_global_loss,
+                        "train/global_step": self.global_step,
+                        "train/step": self.step,
+                        "train/epoch": self.current_epoch,
+                    }
+                )
                 optimizer.step()
 
                 def on_before_zero_grad(optimizer):
@@ -219,7 +232,8 @@ class Trainer:
                 optimizer.zero_grad()
             else:
                 # gradient accumulation -> no optimizer step
-                self.training_step(model=model, batch=batch, batch_idx=batch_idx)
+                loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
+                global_loss += loss
 
             def on_train_batch_end(outputs, batch, batch_idx):
                 pass
@@ -227,11 +241,19 @@ class Trainer:
             on_train_batch_end(self._current_train_return, batch, batch_idx)
             # this guard ensures, we only step the scheduler once per global step
             if should_optim_step:
-                self.step_scheduler(model, scheduler_cfg, level="step", current_value=self.global_step)
+                self.web_logger.log(
+                    {
+                        "train/optim_0_learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/global_step": self.global_step,
+                        "train/step": self.step,
+                        "train/current_epoch": self.current_epoch,
+                    }
+                )
+                self.step_scheduler(scheduler_cfg, level="step", current_value=self.global_step)
 
             # add output values to progress bar
             self._format_iterable(iterable, self._current_train_return, "train")
-
+            self.step += 1
             # only increase global step if optimizer stepped
             self.global_step += int(should_optim_step)
 
@@ -273,7 +295,8 @@ class Trainer:
             pass
 
         iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
-
+        eval_step = 0
+        tot_loss = 0
         for batch_idx, batch in enumerate(iterable):
             # end epoch if stopping training completely or max batches for this epoch reached
             if self.should_stop or batch_idx >= limit_batches:
@@ -295,15 +318,24 @@ class Trainer:
 
             on_validation_batch_end(outputs, batch, batch_idx)
             self._current_val_return = outputs
-
-            self._format_iterable(iterable, self._current_val_return, "val")
-
-        def on_validation_epoch_end():
-            self.logger.info(
-                f"val_loss: {self._current_val_return['loss']:.20f}, step: {batch_idx * self.current_epoch}"
+            tot_loss += self._current_val_return["loss"]
+            self.web_logger.log(
+                {
+                    "eval_step/loss": self._current_val_return["loss"],
+                    "eval_step/step": eval_step,
+                    "eval_step/global_step": self.global_step,
+                    "eval_step/epoch": self.current_epoch,
+                }
             )
+            self._format_iterable(iterable, self._current_val_return, "val")
+            eval_step += 1
+        print(self.current_epoch)
 
-        on_validation_epoch_end()
+        def on_validation_epoch_end(tot_loss):
+            tot_loss = tot_loss / len(val_loader)
+            self.web_logger.log({"eval/loss": tot_loss, "eval/epoch": self.current_epoch})
+
+        on_validation_epoch_end(tot_loss)
 
         def on_validation_model_train():
             pass
@@ -330,7 +362,6 @@ class Trainer:
 
         on_before_backward(loss)
         loss.backward()
-        self.step += 1
 
         def on_after_backward():
             pass
@@ -340,12 +371,18 @@ class Trainer:
         outputs = {"loss": loss}
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
-        self.logger.info(f"train_loss: {self._current_train_return['loss']:.20f}, step: {self.step}")
+        self.web_logger.log(
+            {
+                "train/loss": self._current_train_return["loss"],
+                "train/step": self.step,
+                "train/global_step": self.global_step,
+                "train/epoch": self.current_epoch,
+            }
+        )
         return loss
 
     def step_scheduler(
         self,
-        model,
         scheduler_cfg: Optional[Mapping],
         level: Literal["step", "epoch"],
         current_value: int,
@@ -353,7 +390,6 @@ class Trainer:
         """Steps the learning rate scheduler if necessary.
 
         Args:
-            model: The LightningModule to train
             scheduler_cfg: The learning rate scheduler configuration.
                 Have a look at :meth:`lightning.pytorch.LightningModule.configure_optimizers` for supported values.
             level: whether we are trying to step on epoch- or step-level

@@ -351,6 +351,10 @@ def save_checkpoint(
     if optimizer is not None:
         optimizer_state_dict = optimizer.state_dict()
 
+    scheduler_state_dict = None
+    if scheduler_cfg["scheduler"] is not None:
+        scheduler_state_dict = scheduler_cfg["scheduler"].state_dict()
+
     loss_state_dict = None
     if trainable_loss is not None:
         if hasattr(trainable_loss, "module"):
@@ -365,7 +369,7 @@ def save_checkpoint(
             "step": step,
             "model": state_dict,
             "optimizer": optimizer_state_dict,
-            "scheduler_cfg": scheduler_cfg,
+            "scheduler": scheduler_state_dict,
             "trainable_loss": loss_state_dict,
         },
         checkpoint_filepath,
@@ -424,10 +428,10 @@ def load_checkpoint(
     if (
         "scheduler_cfg" in state.keys()
         and state["scheduler_cfg"] is not None
-        and "scheduler_cfg" in checkpoint_dict.keys()
-        and checkpoint_dict["scheduler_cfg"] is not None
+        and "scheduler" in checkpoint_dict.keys()
+        and checkpoint_dict["scheduler"] is not None
     ):
-        state.update({"scheduler_cfg": checkpoint_dict["scheduler_cfg"]})
+        state["scheduler_cfg"]["scheduler"].load_state_dict(checkpoint_dict["scheduler"])
 
     # trainable_loss
     if (

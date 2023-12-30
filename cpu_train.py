@@ -19,6 +19,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
+import wandb
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -34,7 +35,7 @@ logger.addHandler(timeFileHandler)
 
 def main(hparams: TrainingArguments):
     setproctitle(os.environ.get("WANDB_PROJECT", "lightning_logs"))
-
+    web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
     os.makedirs(hparams.output_dir, exist_ok=True)
 
@@ -98,6 +99,7 @@ def main(hparams: TrainingArguments):
 
     # Instantiate objects
     model = Net(input_dim=5, hidden_dim=10, seq_len=seq_length, output_dim=1, layers=1)
+    wandb.watch(model, log_freq=hparams.log_every_n_steps)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=hparams.learning_rate,
@@ -105,7 +107,6 @@ def main(hparams: TrainingArguments):
         betas=(hparams.optim_beta1, hparams.optim_beta2),
         weight_decay=hparams.weight_decay,
     )
-
     if hparams.group_by_length:
         custom_train_sampler = LengthGroupedSampler(
             batch_size=hparams.batch_size, dataset=train_dataset, model_input_name=train_dataset.length_column
@@ -178,6 +179,7 @@ def main(hparams: TrainingArguments):
 
     trainer = Trainer(
         cmd_logger=logger,
+        web_logger=web_logger,
         max_epochs=hparams.max_epochs,
         grad_accum_steps=hparams.accumulate_grad_batches,
         total_global_step=steps_per_epoch,
@@ -194,6 +196,7 @@ def main(hparams: TrainingArguments):
         val_loader=eval_dataloader,
         ckpt_path=hparams.output_dir,
         trainable_loss=trainable_loss,
+        wandb_upload_wait=10,
     )
 
 
