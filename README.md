@@ -47,7 +47,7 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
      -   `frequency` is step accumulation, if is 2, for every 2 train steps, take 1 scheduler step.
      -   `monitor` is for only `ReduceLROnPlateau`'s loss value
 7.   I'm used dict inplace very much. so, use `chk_addr_dict` for compare dict addr. if it is difference, it causes unexpected results. 
-
+8. `cd {your-workpsace}/pytorch-trainer` & `sh scripts/run_train_[cpu|ddp|deepseed].sh`
 # TODO LIST
 
 -   [x] cpu_trainer - lstm example, but it training is weird
