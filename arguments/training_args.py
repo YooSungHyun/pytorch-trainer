@@ -18,9 +18,8 @@ class TrainingArguments:
     optim_beta2: float = 0.999
     optim_eps: float = 1e-08
     weight_decay: float = 0.01
-    learning_rate: float = 0.001  # learning rate
+    learning_rate: float = 0.001  # learning rate (if warmup, this is max_lr)
     warmup_ratio: float = 0.2  # learning rate scheduler warmup ratio per EPOCH
-    max_lr: float = 0.01  # lr_scheduler max learning rate
     div_factor: int = 25  # initial_lr = max_lr/div_factor
     final_div_factor: int = 1e4  # (max_lr/div_factor)*final_div_factor is final lr
     weight_decay: float = 0.0001  # weigth decay
@@ -38,4 +37,3 @@ class TrainingArguments:
     accumulate_grad_batches: int = 1
     max_epochs: int = 1
     log_every_n_steps: int = 1
-    further_learn_path: str = None

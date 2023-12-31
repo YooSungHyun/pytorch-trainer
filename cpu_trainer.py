@@ -238,7 +238,7 @@ class Trainer:
                         "train/optim_0_learning_rate": optimizer.param_groups[0]["lr"],
                         "train/global_step": self.global_step,
                         "train/step": self.step,
-                        "train/current_epoch": self.current_epoch,
+                        "train/epoch": self.current_epoch,
                     }
                 )
                 self.step_scheduler(scheduler_cfg, level="step", current_value=self.global_step)
@@ -288,7 +288,8 @@ class Trainer:
 
         iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
         eval_step = 0
-        tot_loss = 0
+        tot_batch_result = list()
+        tot_batch_labels = list()
         for batch_idx, batch in enumerate(iterable):
             # end epoch if stopping training completely or max batches for this epoch reached
             if self.should_stop or batch_idx >= limit_batches:
@@ -301,6 +302,10 @@ class Trainer:
             inputs, labels = batch
             outputs = model(inputs)
             loss = self.criterion(outputs, labels)
+
+            tot_batch_result.append(outputs)
+            tot_batch_labels.append(labels)
+
             outputs = {"loss": loss}
             # avoid gradients in stored/accumulated values -> prevents potential OOM
             outputs = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
@@ -310,7 +315,6 @@ class Trainer:
 
             on_validation_batch_end(outputs, batch, batch_idx)
             self._current_val_return = outputs
-            tot_loss += self._current_val_return["loss"]
             self.web_logger.log(
                 {
                     "eval_step/loss": self._current_val_return["loss"],
@@ -321,13 +325,15 @@ class Trainer:
             )
             self._format_iterable(iterable, self._current_val_return, "val")
             eval_step += 1
-        print(self.current_epoch)
 
-        def on_validation_epoch_end(tot_loss):
-            tot_loss = tot_loss / len(val_loader)
-            self.web_logger.log({"eval/loss": tot_loss, "eval/epoch": self.current_epoch})
+        def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
+            tot_batch_result = torch.stack(tot_batch_result)
+            tot_batch_labels = torch.stack(tot_batch_labels)
+            epoch_loss = self.criterion(tot_batch_result, tot_batch_labels)
+            epoch_rmse = torch.sqrt(epoch_loss)
+            self.web_logger.log({"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch})
 
-        on_validation_epoch_end(tot_loss)
+        on_validation_epoch_end(tot_batch_result, tot_batch_labels)
 
         def on_validation_model_train():
             pass

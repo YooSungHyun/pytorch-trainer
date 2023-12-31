@@ -1,6 +1,6 @@
 import math
 import os
-from datetime import timedelta
+from datetime import datetime
 
 import pandas as pd
 import torch
@@ -32,52 +32,74 @@ logger.addHandler(timeFileHandler)
 
 
 def main(hparams: TrainingArguments):
+    # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
     setproctitle(os.environ.get("WANDB_PROJECT", "lightning_logs"))
     web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
     os.makedirs(hparams.output_dir, exist_ok=True)
 
-    train_df = pd.read_csv(hparams.train_datasets_path, encoding="utf-8")
-    # 7 day gap
-    seq_length = 7
+    df_train = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
+    # Kaggle author Test Final RMSE: 0.06539
+    df_eval = pd.read_csv(hparams.eval_datasets_path, header=0, encoding="utf-8")
 
-    train_df = train_df[::-1]
-    train_size = int(len(train_df) * 0.7)
-    train_set = train_df[0:train_size]
-    test_set = train_df[train_size - seq_length :]
+    df_train_scaled = df_train.copy()
+    df_test_scaled = df_eval.copy()
 
-    # Input scale
-    scaler_x = MinMaxScaler()
-    scaler_x.fit(train_set.iloc[:, :-1])
+    # Define the mapping dictionary
+    mapping = {"NE": 0, "SE": 1, "NW": 2, "cv": 3}
 
-    train_set.iloc[:, :-1] = scaler_x.transform(train_set.iloc[:, :-1])
-    test_set.iloc[:, :-1] = scaler_x.transform(test_set.iloc[:, :-1])
+    # Replace the string values with numerical values
+    df_train_scaled["wnd_dir"] = df_train_scaled["wnd_dir"].map(mapping)
+    df_test_scaled["wnd_dir"] = df_test_scaled["wnd_dir"].map(mapping)
 
-    # Output scale
-    scaler_y = MinMaxScaler()
-    scaler_y.fit(train_set.iloc[:, [-1]])
+    df_train_scaled["date"] = pd.to_datetime(df_train_scaled["date"])
+    # Resetting the index
+    df_train_scaled.set_index("date", inplace=True)
+    logger.info(df_train_scaled.head())
 
-    train_set.iloc[:, -1] = scaler_y.transform(train_set.iloc[:, [-1]])
-    test_set.iloc[:, -1] = scaler_y.transform(test_set.iloc[:, [-1]])
+    scaler = MinMaxScaler()
 
-    # quick example use
-    def build_dataset(time_series, seq_length):
-        dataX = []
-        dataY = []
-        for i in range(0, len(time_series) - seq_length):
-            _x = time_series[i : i + seq_length, :]
-            _y = time_series[i + seq_length, [-1]]
-            # print(_x, "-->",_y)
-            dataX.append(_x)
-            dataY.append(_y)
+    # Define the columns to scale
+    columns = ["pollution", "dew", "temp", "press", "wnd_dir", "wnd_spd", "snow", "rain"]
 
-        return np.array(dataX), np.array(dataY)
+    df_test_scaled = df_test_scaled[columns]
 
-    trainX, trainY = build_dataset(np.array(train_set), seq_length)
-    testX, testY = build_dataset(np.array(test_set), seq_length)
+    # Scale the selected columns to the range 0-1
+    df_train_scaled[columns] = scaler.fit_transform(df_train_scaled[columns])
+    df_test_scaled[columns] = scaler.transform(df_test_scaled[columns])
 
-    train_dataset = NumpyDataset(trainX, trainY)
-    eval_dataset = NumpyDataset(testX, testY)
+    # Show the scaled data
+    logger.info(df_train_scaled.head())
+
+    df_train_scaled = np.array(df_train_scaled)
+    df_test_scaled = np.array(df_test_scaled)
+
+    x = []
+    y = []
+    n_future = 1
+    n_past = 11
+
+    #  Train Sets
+    for i in range(n_past, len(df_train_scaled) - n_future + 1):
+        x.append(df_train_scaled[i - n_past : i, 1 : df_train_scaled.shape[1]])
+        y.append(df_train_scaled[i + n_future - 1 : i + n_future, 0])
+    x_train, y_train = np.array(x), np.array(y)
+
+    #  Test Sets
+    x = []
+    y = []
+    for i in range(n_past, len(df_test_scaled) - n_future + 1):
+        x.append(df_test_scaled[i - n_past : i, 1 : df_test_scaled.shape[1]])
+        y.append(df_test_scaled[i + n_future - 1 : i + n_future, 0])
+    x_test, y_test = np.array(x), np.array(y)
+
+    logger.info(
+        "X_train shape : {}   y_train shape : {} \n"
+        "X_test shape : {}      y_test shape : {} ".format(x_train.shape, y_train.shape, x_test.shape, y_test.shape)
+    )
+
+    train_dataset = NumpyDataset(x_train, y_train)
+    eval_dataset = NumpyDataset(x_test, y_test)
     # if hparams.eval_datasets_path:
     #     eval_df = pd.read_csv(hparams.eval_datasets_path)
     #     train_dataset = PandasDataset(train_df, length_column=hparams.length_column)
@@ -96,8 +118,9 @@ def main(hparams: TrainingArguments):
     # eval_dataset = PandasDataset(eval_df, length_column=hparams.length_column)
 
     # Instantiate objects
-    model = Net(input_dim=5, hidden_dim=10, seq_len=seq_length, output_dim=1, layers=1)
+    model = Net()
     wandb.watch(model, log_freq=hparams.log_every_n_steps)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=hparams.learning_rate,
@@ -105,6 +128,7 @@ def main(hparams: TrainingArguments):
         betas=(hparams.optim_beta1, hparams.optim_beta2),
         weight_decay=hparams.weight_decay,
     )
+
     if hparams.group_by_length:
         custom_train_sampler = LengthGroupedSampler(
             batch_size=hparams.batch_size, dataset=train_dataset, model_input_name=train_dataset.length_column
@@ -113,31 +137,30 @@ def main(hparams: TrainingArguments):
             batch_size=hparams.batch_size, dataset=eval_dataset, model_input_name=eval_dataset.length_column
         )
     else:
-        custom_train_sampler = SequentialSampler(train_dataset)
-        custom_eval_sampler = SequentialSampler(eval_dataset)
-        # custom_train_sampler = RandomSampler(train_dataset)
-        # custom_eval_sampler = RandomSampler(eval_dataset)
+        # custom_train_sampler = SequentialSampler(train_dataset)
+        # custom_eval_sampler = SequentialSampler(eval_dataset)
+        custom_train_sampler = RandomSampler(train_dataset)
+        custom_eval_sampler = RandomSampler(eval_dataset)
 
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
         key_to_inputs=["inputs"],
         key_to_labels=["labels"],
         batch_size=hparams.per_device_train_batch_size,
+        sampler=custom_train_sampler,
         num_workers=hparams.num_workers,
-        drop_last=True,
-        shuffle=True,
     )
+
     eval_dataloader = CustomDataLoader(
         dataset=eval_dataset,
         key_to_inputs=["inputs"],
         key_to_labels=["labels"],
         batch_size=hparams.per_device_eval_batch_size,
+        sampler=custom_eval_sampler,
         num_workers=hparams.num_workers,
-        drop_last=True,
-        shuffle=True,
     )
 
-    steps_per_epoch = math.ceil(len(train_dataloader) // (1 * hparams.accumulate_grad_batches))
+    steps_per_epoch = math.ceil(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=hparams.learning_rate,
@@ -147,7 +170,7 @@ def main(hparams: TrainingArguments):
         steps_per_epoch=steps_per_epoch,
     )
     # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
-    lr_scheduler = {"scheduler": scheduler, "frequency": 1, "monitor": None}
+    lr_scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}
     assert id(scheduler) == id(lr_scheduler["scheduler"])
     criterion = torch.nn.MSELoss()
     trainable_loss = None
