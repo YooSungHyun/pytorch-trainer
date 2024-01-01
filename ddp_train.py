@@ -6,17 +6,20 @@ from logging import StreamHandler
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import wandb
 from arguments.training_args import TrainingArguments
-from cpu_trainer import Trainer
+from ddp_trainer import Trainer
 from networks.models import Net
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
 from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import RandomSampler, SequentialSampler, random_split
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler, random_split
 from utils.comfy import dataclass_to_namespace, seed_everything
 from utils.data.custom_dataloader import CustomDataLoader
-from utils.data.custom_sampler import LengthGroupedSampler
+from utils.data.custom_sampler import DistributedLengthGroupedSampler
 from utils.data.np_dataset import NumpyDataset
 from utils.data.pd_dataset import PandasDataset
 
@@ -31,6 +34,12 @@ logger.addHandler(timeFileHandler)
 
 
 def main(hparams: TrainingArguments):
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    logger.info(f"Start running basic DDP example on rank {rank}.")
+
+    device_id = rank % torch.cuda.device_count()
+
     # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
     setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
     web_logger = wandb.init(config=hparams)
@@ -117,7 +126,8 @@ def main(hparams: TrainingArguments):
     # eval_dataset = PandasDataset(eval_df, length_column=hparams.length_column)
 
     # Instantiate objects
-    model = Net()
+    model = Net().to(device_id)
+    ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
     wandb.watch(model, log_freq=hparams.log_every_n_steps)
 
     optimizer = torch.optim.AdamW(
@@ -128,26 +138,24 @@ def main(hparams: TrainingArguments):
         weight_decay=hparams.weight_decay,
     )
 
-    generator = torch.Generator()
-    generator.manual_seed(hparams.seed)
     if hparams.group_by_length:
-        custom_train_sampler = LengthGroupedSampler(
+        custom_train_sampler = DistributedLengthGroupedSampler(
             batch_size=hparams.batch_size,
             dataset=train_dataset,
+            rank=device_id,
+            seed=hparams.seed,
             model_input_name=train_dataset.length_column,
-            generator=generator,
         )
-        custom_eval_sampler = LengthGroupedSampler(
+        custom_eval_sampler = DistributedLengthGroupedSampler(
             batch_size=hparams.batch_size,
             dataset=eval_dataset,
+            rank=device_id,
+            seed=hparams.seed,
             model_input_name=eval_dataset.length_column,
-            generator=generator,
         )
     else:
-        # custom_train_sampler = SequentialSampler(train_dataset)
-        # custom_eval_sampler = SequentialSampler(eval_dataset)
-        custom_train_sampler = RandomSampler(train_dataset, generator=generator)
-        custom_eval_sampler = RandomSampler(eval_dataset, generator=generator)
+        custom_train_sampler = DistributedSampler(train_dataset, seed=hparams.seed, rank=device_id)
+        custom_eval_sampler = DistributedSampler(eval_dataset, seed=hparams.seed, rank=device_id)
 
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
@@ -167,7 +175,7 @@ def main(hparams: TrainingArguments):
         num_workers=hparams.num_workers,
     )
 
-    steps_per_epoch = math.ceil(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
+    steps_per_epoch = math.ceil(len(train_dataloader) / (dist.get_world_size() * hparams.accumulate_grad_batches))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=hparams.learning_rate,
@@ -207,6 +215,7 @@ def main(hparams: TrainingArguments):
     logger.info(log_str)
 
     trainer = Trainer(
+        device_id=device_id,
         cmd_logger=logger,
         web_logger=web_logger,
         max_epochs=hparams.max_epochs,
@@ -218,7 +227,7 @@ def main(hparams: TrainingArguments):
     )
 
     trainer.fit(
-        model=model,
+        model=ddp_model,
         optimizer=optimizer,
         criterion=criterion,
         scheduler_cfg=lr_scheduler,
@@ -226,11 +235,13 @@ def main(hparams: TrainingArguments):
         val_loader=eval_dataloader,
         ckpt_path=hparams.output_dir,
         trainable_loss=trainable_loss,
-        wandb_upload_wait=600,
+        wandb_upload_wait=300,
     )
 
 
 if __name__ == "__main__":
+    assert torch.distributed.is_available(), "DDP is only multi gpu!! check plz!"
+    assert torch.cuda.is_available(), "CPU training is not allowed."
     parser = ArgumentParser()
     parser.add_arguments(TrainingArguments, dest="training_args")
     args = parser.parse_args()

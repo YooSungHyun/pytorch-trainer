@@ -37,3 +37,4 @@ class TrainingArguments:
     accumulate_grad_batches: int = 1
     max_epochs: int = 1
     log_every_n_steps: int = 1
+    labels_column_name: str = "labels"

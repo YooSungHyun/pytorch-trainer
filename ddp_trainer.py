@@ -6,6 +6,7 @@ import time
 import torch
 from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device
 from tqdm import tqdm
+import torch.distributed as dist
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -13,6 +14,7 @@ precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.f
 class Trainer:
     def __init__(
         self,
+        device_id,
         total_global_step: int,
         precision="fp32",
         cmd_logger=None,
@@ -52,6 +54,9 @@ class Trainer:
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
         """
+        self.device_id = device_id  # it is same rank
+        self.device = torch.device("cuda:{}".format(device_id))
+
         if precision in ["fp16", "float16"]:
             self.precision = precision_dict["fp16"]
         elif precision in ["bf16" or "bfloat16"]:
@@ -188,12 +193,19 @@ class Trainer:
             model.train()
 
         on_train_epoch_start()
-        iterable = self.progbar_wrapper(
-            train_loader, total=min(self.total_global_step, limit_batches), desc=f"Epoch {self.current_epoch}"
-        )
+        if self.device_id == 0:
+            iterable = self.progbar_wrapper(
+                train_loader, total=min(self.total_global_step, limit_batches), desc=f"Epoch {self.current_epoch}"
+            )
+            pbar = enumerate(iterable)
+        else:
+            pbar = enumerate(train_loader)
 
-        for batch_idx, batch in enumerate(iterable):
-            tensor_dict_to_device(batch, "cpu", non_blocking=self.non_blocking)
+        # CPU trainer data size: 1369 (1 accum)
+        # DDP trainer data size: 1369/4 = drop last false: 343, drop last true: 342
+        for batch_idx, batch in pbar:
+            train_loader.sampler.set_epoch(self.current_epoch)
+            tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
             # end epoch if stopping training completely or max batches for this epoch reached
             if self.should_stop or batch_idx >= limit_batches:
                 break
@@ -215,14 +227,15 @@ class Trainer:
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
                 global_loss += loss
                 mean_global_loss = global_loss / self.grad_accum_steps
-                self.web_logger.log(
-                    {
-                        "train/global_step_loss": mean_global_loss,
-                        "train/global_step": self.global_step,
-                        "train/step": self.step,
-                        "train/epoch": self.current_epoch,
-                    }
-                )
+                if self.device_id == 0:
+                    self.web_logger.log(
+                        {
+                            "train/global_step_loss": mean_global_loss,
+                            "train/global_step": self.global_step,
+                            "train/step": self.step,
+                            "train/epoch": self.current_epoch,
+                        }
+                    )
                 optimizer.step()
 
                 def on_before_zero_grad(optimizer):
@@ -299,6 +312,12 @@ class Trainer:
         tot_batch_result = list()
         tot_batch_labels = list()
         for batch_idx, batch in enumerate(iterable):
+            # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
+
+            # if you think, each epoch's evaluation step is used another data at each device?
+            # so, next line use
+            # val_loader.sampler.set_epoch(self.current_epoch)
+
             # end epoch if stopping training completely or max batches for this epoch reached
             if self.should_stop or batch_idx >= limit_batches:
                 break
@@ -324,23 +343,48 @@ class Trainer:
 
             on_validation_batch_end(outputs, batch, batch_idx)
             self._current_val_return = outputs
-            self.web_logger.log(
-                {
-                    "eval_step/loss": self._current_val_return["loss"],
-                    "eval_step/step": eval_step,
-                    "eval_step/global_step": self.global_step,
-                    "eval_step/epoch": self.current_epoch,
-                }
-            )
+            if self.device_id == 0:
+                self.web_logger.log(
+                    {
+                        "eval_step/loss": self._current_val_return["loss"],
+                        "eval_step/step": eval_step,
+                        "eval_step/global_step": self.global_step,
+                        "eval_step/epoch": self.current_epoch,
+                    }
+                )
             self._format_iterable(iterable, self._current_val_return, "val")
             eval_step += 1
 
         def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
             tot_batch_result = torch.stack(tot_batch_result)
             tot_batch_labels = torch.stack(tot_batch_labels)
-            epoch_loss = self.criterion(tot_batch_result, tot_batch_labels)
+
+            # 전체의 length를 일단 감안해본다.
+            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long).to(self.device)
+            size_list = [torch.tensor([0], dtype=torch.long).to(self.device) for _ in range(dist.get_world_size())]
+            dist.all_gather(size_list, local_size)
+
+            # drop_last 영향으로 길이가 달라질 수도 있고해서, 일일이 길이를 구한다음에 처리해야한다.
+            result_gathered_data = [
+                torch.zeros(
+                    (size.item(), tot_batch_result.size(1), tot_batch_result.size(2)), dtype=tot_batch_result.dtype
+                )
+                for size in size_list
+            ]
+            labels_gathered_data = [
+                torch.zeros(
+                    (size.item(), tot_batch_labels.size(1), tot_batch_labels.size(2)), dtype=tot_batch_labels.dtype
+                )
+                for size in size_list
+            ]
+            # 모든 프로세스의 데이터를 수집
+            dist.all_gather(result_gathered_data, tot_batch_result)
+            dist.all_gather(labels_gathered_data, tot_batch_labels)
+
+            epoch_loss = self.criterion(result_gathered_data, labels_gathered_data)
             epoch_rmse = torch.sqrt(epoch_loss)
-            self.web_logger.log({"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch})
+            if self.device_id == 0:
+                self.web_logger.log({"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch})
 
         on_validation_epoch_end(tot_batch_result, tot_batch_labels)
 
@@ -379,14 +423,15 @@ class Trainer:
         outputs = {"loss": loss}
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
-        self.web_logger.log(
-            {
-                "train/loss": self._current_train_return["loss"],
-                "train/step": self.step,
-                "train/global_step": self.global_step,
-                "train/epoch": self.current_epoch,
-            }
-        )
+        if self.device_id == 0:
+            self.web_logger.log(
+                {
+                    "train/loss": self._current_train_return["loss"],
+                    "train/step": self.step,
+                    "train/global_step": self.global_step,
+                    "train/epoch": self.current_epoch,
+                }
+            )
         return loss
 
     def step_scheduler(
@@ -469,13 +514,13 @@ class Trainer:
         if state is None:
             state = {}
 
-        load_checkpoint(state, checkpoint_filepath=path, logger=self.logger)
+        load_checkpoint(state, checkpoint_filepath=path, device=self.device, logger=self.logger)
         self.global_step = state.pop("global_step")
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
 
         if state:
-            self.logger.info(f"Unused Checkpoint Values: {state}, returned")
+            self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")
 
         return state
 

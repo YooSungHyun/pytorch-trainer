@@ -53,7 +53,7 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 -   [x] cpu_trainer - lstm example, but it training is weird
 -   [x] cpu_trainer - wandb
 -   [x] cpu_trainer - continuous learning
--   [x] cpu_trainer - weird lstm training fix ([wandb](https://wandb.ai/bart_tadev/torch-trainer/runs/xrvi8x4g?workspace=user-bart_tadev))
+-   [x] cpu_trainer - weird lstm training fix ([wandb](https://wandb.ai/bart_tadev/torch-trainer/runs/jmnr1pcf?workspace=user-bart_tadev))
 -   [ ] ddp_trainer - lstm or mnist example
 -   [ ] ddp_trainer - sampler and dataloader
 -   [ ] ddp_trainer = add fp16 and bf16 use

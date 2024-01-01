@@ -1,5 +1,9 @@
+import dataclasses
 import os
 import random
+from collections import OrderedDict, defaultdict
+from copy import deepcopy
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,10 +32,6 @@ def seed_everything(random_seed: int) -> None:
 # Licensed under the Apache License, Version 2.0 (the "License");
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-import dataclasses
-from collections import OrderedDict, defaultdict
-from copy import deepcopy
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 
 def is_namedtuple(obj: object) -> bool:
@@ -379,8 +379,9 @@ def save_checkpoint(
 def load_checkpoint(
     state: dict,
     checkpoint_filepath: str,
-    load_bias: bool = True,
+    device: str = "cpu",
     logger=None,
+    load_bias: bool = True,
 ):
     """Load model checkpoint.
 
@@ -393,7 +394,7 @@ def load_checkpoint(
         state: dict
     """
     assert os.path.isfile(checkpoint_filepath)
-    checkpoint_dict = torch.load(checkpoint_filepath, map_location="cpu")
+    checkpoint_dict = torch.load(checkpoint_filepath, map_location=device)
 
     # epoch
     current_epoch = (
@@ -468,3 +469,15 @@ def load_checkpoint(
 
     if logger is not None:
         logger.info(f"Loaded checkpoint '{checkpoint_filepath}' epoch: {current_epoch} global_step: {global_step}")
+
+
+def tensor_dict_to_device(tensor_dict: Dict[str, torch.Tensor], device: str = "cpu", non_blocking: bool = False):
+    assert isinstance(tensor_dict, dict), f"tensor_dict is not dicts. Found {type(tensor_dict)}."
+
+    for k, v in tensor_dict.items():
+        if isinstance(v, dict):
+            tensor_dict_to_device(v, device, non_blocking=non_blocking)
+        elif isinstance(v, torch.Tensor):
+            tensor_dict[k] = v.to(device, non_blocking=non_blocking)
+        else:
+            raise TypeError(f"value of dict is not torch.Tensor. Found {type(v)}")
