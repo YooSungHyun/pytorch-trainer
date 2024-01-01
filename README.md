@@ -65,7 +65,6 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 -   [ ] deepspeed_trainer - training loop additional process?(for distributed learning)
 -   [ ] deepspeed_trainer - wandb have to using gather or something?
 -   [ ] deepspeed_trainer - Reliable wandb logging for distributed learning
--   [ ] what can i do use accelerator?
 
 # Unsupported list
 

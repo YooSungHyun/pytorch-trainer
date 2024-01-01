@@ -287,59 +287,60 @@ class Trainer:
 
         def on_validation_model_eval(model):
             model.eval()
+            # requires_grad = True, but loss.backward() raised error
+            torch.set_grad_enabled(False)
 
         on_validation_model_eval(model)
 
-e        with torch.set_grad_enabled(model.training):
+        def on_validation_epoch_start():
+            pass
 
-            def on_validation_epoch_start():
+        iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
+        eval_step = 0
+        tot_batch_result = list()
+        tot_batch_labels = list()
+        for batch_idx, batch in enumerate(iterable):
+            # end epoch if stopping training completely or max batches for this epoch reached
+            if self.should_stop or batch_idx >= limit_batches:
+                break
+
+            def on_validation_batch_start(batch, batch_idx):
                 pass
 
-            iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
-            eval_step = 0
-            tot_batch_result = list()
-            tot_batch_labels = list()
-            for batch_idx, batch in enumerate(iterable):
-                # end epoch if stopping training completely or max batches for this epoch reached
-                if self.should_stop or batch_idx >= limit_batches:
-                    break
+            on_validation_batch_start(batch, batch_idx)
 
-                def on_validation_batch_start(batch, batch_idx):
-                    pass
+            # TODO(User): If you needs more labels than 1, must change this line (make your labels)
+            labels = batch.pop("labels")
 
-                on_validation_batch_start(batch, batch_idx)
+            outputs = model(**batch)
 
-                # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-                labels = batch.pop("labels")
+            loss = self.criterion(outputs, labels)
 
-                outputs = model(**batch)
-                loss = self.criterion(outputs, labels)
+            tot_batch_result.append(outputs)
+            tot_batch_labels.append(labels)
 
-                tot_batch_result.append(outputs)
-                tot_batch_labels.append(labels)
+            outputs = {"loss": loss}
+            # avoid gradients in stored/accumulated values -> prevents potential OOM
+            self._current_val_return = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
 
-                outputs = {"loss": loss}
-                # avoid gradients in stored/accumulated values -> prevents potential OOM
-                outputs = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
+            def on_validation_batch_end(eval_out, batch, batch_idx):
+                pass
 
-                def on_validation_batch_end(eval_out, batch, batch_idx):
-                    pass
-
-                on_validation_batch_end(outputs, batch, batch_idx)
-                self._current_val_return = outputs
-                web_log_every_n(
-                    self.web_logger,
-                    {
-                        "eval_step/loss": self._current_val_return["loss"],
-                        "eval_step/step": eval_step,
-                        "eval_step/global_step": self.global_step,
-                        "eval_step/epoch": self.current_epoch,
-                    },
-                    eval_step,
-                    self.log_every_n,
-                )
-                self._format_iterable(iterable, self._current_val_return, "val")
-                eval_step += 1
+            on_validation_batch_end(outputs, batch, batch_idx)
+            self._current_val_return = outputs
+            web_log_every_n(
+                self.web_logger,
+                {
+                    "eval_step/loss": self._current_val_return["loss"],
+                    "eval_step/step": eval_step,
+                    "eval_step/global_step": self.global_step,
+                    "eval_step/epoch": self.current_epoch,
+                },
+                eval_step,
+                self.log_every_n,
+            )
+            self._format_iterable(iterable, self._current_val_return, "val")
+            eval_step += 1
 
         def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
             tot_batch_result = torch.stack(tot_batch_result)

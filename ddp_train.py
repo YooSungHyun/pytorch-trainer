@@ -249,6 +249,7 @@ def main(hparams: TrainingArguments):
         chk_addr_dict=chk_addr_dict,
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,
+        max_norm=hparams.max_norm,
     )
 
     trainer.fit(

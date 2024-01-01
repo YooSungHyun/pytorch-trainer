@@ -7,6 +7,7 @@ import torch
 from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
 import torch.distributed as dist
+from torch.cuda.amp import GradScaler, autocast
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -30,6 +31,7 @@ class Trainer:
         chk_addr_dict: dict = None,
         non_blocking: bool = True,
         log_every_n: int = 1,
+        max_norm: float = 0.0,
     ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
@@ -56,12 +58,16 @@ class Trainer:
         self.device_id = device_id  # it is same rank
         self.device = torch.device("cuda:{}".format(device_id))
 
+        self.is_fp16 = False
         if precision in ["fp16", "float16"]:
             self.precision = precision_dict["fp16"]
+            self.is_fp16 = True
         elif precision in ["bf16" or "bfloat16"]:
             self.precision = precision_dict["bf16"]
         else:
             self.precision = precision_dict["fp32"]
+
+        self.grad_scaler = GradScaler(enabled=self.is_fp16)
 
         self.logger = cmd_logger
         self.web_logger = web_logger
@@ -97,6 +103,8 @@ class Trainer:
 
         self.non_blocking = non_blocking
         self.log_every_n = log_every_n
+
+        self.max_norm = max_norm
 
     def fit(
         self,
@@ -224,13 +232,11 @@ class Trainer:
                 # optimizer step runs train step internally through closure
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
                 global_loss += loss
-                gl_list = [
-                    torch.LongTensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())
-                ]
+                gl_list = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
                 dist.all_gather(gl_list, global_loss)
                 dist.barrier()
                 # gl_list = [gpu0 global_loss, gpu1 global_loss, gpu2, gpu3]
-                mean_global_loss = sum(gl_list) / self.grad_accum_steps
+                mean_global_loss = torch.sum(torch.cat(gl_list)) / self.grad_accum_steps
                 # global_step loss check
                 web_log_every_n(
                     self.web_logger,
@@ -243,7 +249,13 @@ class Trainer:
                     self.log_every_n,
                     self.device_id,
                 )
-                optimizer.step()
+
+                if self.max_norm > 0.0:
+                    self.grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.max_norm)
+
+                self.grad_scaler.step(optimizer)
+                self.grad_scaler.update()
 
                 def on_before_zero_grad(optimizer):
                     pass
@@ -311,8 +323,8 @@ class Trainer:
             return
 
         def on_validation_model_eval(model):
-            torch.set_grad_enabled(False)
             model.eval()
+            torch.set_grad_enabled(False)
 
         on_validation_model_eval(model)
 
@@ -352,17 +364,21 @@ class Trainer:
 
             outputs = {"loss": loss}
             # avoid gradients in stored/accumulated values -> prevents potential OOM
-            outputs = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
+            self._current_val_return = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
 
             def on_validation_batch_end(eval_out, batch, batch_idx):
                 pass
 
             on_validation_batch_end(outputs, batch, batch_idx)
-            self._current_val_return = outputs
+
+            loss_list = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
+            dist.all_gather(loss_list, self._current_val_return["loss"])
+            dist.barrier()
+
             web_log_every_n(
                 self.web_logger,
                 {
-                    "eval_step/loss": self._current_val_return["loss"],
+                    "eval_step/loss": torch.mean(torch.cat(loss_list)),
                     "eval_step/step": eval_step,
                     "eval_step/global_step": self.global_step,
                     "eval_step/epoch": self.current_epoch,
@@ -381,10 +397,8 @@ class Trainer:
 
             # all_gather` requires a `fixed length tensor` as input.
             # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
-            local_size = torch.LongTensor([tot_batch_result.size(0)], dtype=torch.long, device=self.device)
-            size_list = [
-                torch.LongTensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())
-            ]
+            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=self.device)
+            size_list = [torch.tensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
             dist.all_gather(size_list, local_size)
             dist.barrier()
 
@@ -436,16 +450,17 @@ class Trainer:
 
         """
         # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-        labels = batch.pop("labels")
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.is_fp16):
+            labels = batch.pop("labels")
 
-        outputs = model(**batch)
-        loss = self.criterion(outputs, labels)
+            outputs = model(**batch)
+            loss = self.criterion(outputs, labels)
 
         def on_before_backward(loss):
             pass
 
         on_before_backward(loss)
-        loss.backward()
+        self.grad_scaler.scale(loss).backward()
 
         def on_after_backward():
             pass
@@ -456,14 +471,14 @@ class Trainer:
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
 
-        loss_list = [torch.tensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
-        dist.all_gather(loss_list, outputs["loss"])
+        loss_list = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
+        dist.all_gather(loss_list, self._current_train_return["loss"])
         dist.barrier()
 
         web_log_every_n(
             self.web_logger,
             {
-                "train/loss": self._current_train_return["loss"],
+                "train/loss": torch.mean(torch.cat(loss_list)),
                 "train/step": self.step,
                 "train/global_step": self.global_step,
                 "train/epoch": self.current_epoch,
