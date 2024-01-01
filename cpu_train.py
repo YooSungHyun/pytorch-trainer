@@ -159,6 +159,7 @@ def main(hparams: TrainingArguments):
         custom_train_sampler = RandomSampler(train_dataset, generator=generator)
         custom_eval_sampler = RandomSampler(eval_dataset, generator=generator)
 
+    # If 1 device for training, sampler suffle True and dataloader shuffle True is same Meaning
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
         feature_column_name=hparams.feature_column_name,
@@ -181,7 +182,7 @@ def main(hparams: TrainingArguments):
         shuffle=hparams.dataloader_shuffle,
     )
 
-    if train_dataloader.dataloader_drop_last:
+    if hparams.dataloader_drop_last:
         # if last batch data drop, that is same to floor
         steps_per_epoch = math.floor(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
     else:

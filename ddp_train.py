@@ -150,23 +150,30 @@ def main(hparams: TrainingArguments):
 
     if hparams.group_by_length:
         custom_train_sampler = DistributedLengthGroupedSampler(
-            batch_size=hparams.batch_size,
+            batch_size=hparams.per_device_train_batch_size,
             dataset=train_dataset,
             rank=device_id,
             seed=hparams.seed,
-            model_input_name=train_dataset.length_column,
+            model_input_name=train_dataset.length_column_name,
         )
         custom_eval_sampler = DistributedLengthGroupedSampler(
-            batch_size=hparams.batch_size,
+            batch_size=hparams.per_device_eval_batch_size,
             dataset=eval_dataset,
             rank=device_id,
             seed=hparams.seed,
-            model_input_name=eval_dataset.length_column,
+            model_input_name=eval_dataset.length_column_name,
         )
     else:
-        custom_train_sampler = DistributedSampler(train_dataset, seed=hparams.seed, rank=device_id)
-        custom_eval_sampler = DistributedSampler(eval_dataset, seed=hparams.seed, rank=device_id)
+        # DistributedSampler's shuffle: each device get random indices data segment in every epoch
+        custom_train_sampler = DistributedSampler(
+            train_dataset, seed=hparams.seed, rank=device_id, shuffle=hparams.sampler_shuffle
+        )
+        custom_eval_sampler = DistributedSampler(
+            eval_dataset, seed=hparams.seed, rank=device_id, shuffle=hparams.sampler_shuffle
+        )
 
+    # DataLoader's shuffle: one device get random indices dataset in every epoch
+    # example np_dataset is already set (feature)7:1(label), so, it can be all shuffle `True` between sampler and dataloader
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
         feature_column_name=hparams.feature_column_name,
@@ -189,7 +196,7 @@ def main(hparams: TrainingArguments):
         shuffle=hparams.dataloader_shuffle,
     )
 
-    if train_dataloader.dataloader_drop_last:
+    if hparams.dataloader_drop_last:
         # if last batch data drop, that is same to floor
         steps_per_epoch = math.floor(len(train_dataloader) / (dist.get_world_size() * hparams.accumulate_grad_batches))
     else:

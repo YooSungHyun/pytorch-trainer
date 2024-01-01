@@ -41,3 +41,4 @@ class TrainingArguments:
     labels_column_name: str = "raw_labels"
     dataloader_drop_last: bool = False
     dataloader_shuffle: bool = True
+    sampler_shuffle: bool = True

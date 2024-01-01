@@ -13,6 +13,7 @@ class NumpyDataset(CustomDataset):
         transform: Callable = None,
         feature_column_name: str = "raw_inputs",
         labels_column_name: str = "raw_labels",
+        length_column_name: str = None,
     ):
         self.np_x = np_x
         self.np_y = np_y
@@ -21,6 +22,8 @@ class NumpyDataset(CustomDataset):
 
         self.feature_column_name = feature_column_name
         self.labels_column_name = labels_column_name
+
+        self.length_column_name = length_column_name
 
     def __len__(self):
         return len(self.np_x)
