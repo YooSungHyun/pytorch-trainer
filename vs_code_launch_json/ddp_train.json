@@ -1,25 +1,30 @@
 {
-    "name": "torch-trainer: cpu",
+    "name": "torch-trainer: ddp",
     "type": "python",
     "request": "launch",
-    "program": "cpu_train.py",
+    "module": "torch.distributed.run",
+    "cwd": "${workspaceFolder}/pytorch-trainer",
     "console": "integratedTerminal",
     "justMyCode": false,
     "subProcess": true,
     "env": {
-        "WANDB_DISABLED":"false",
+        "WANDB_DISABLED": "false",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "OMP_NUM_THREADS": "16",
         "WANDB_PROJECT":"torch-trainer",
         "WANDB_ENTITY":"",
-        "WANDB_NAME":"cpu-lstm"
+        "WANDB_NAME":"ddp-lstm"
     },
-    "cwd": "${workspaceFolder}/pytorch-trainer",
     "args": [
-        "--output_dir=model_outputs_cpu/",
+        "--master_port=25111",
+        "--nproc_per_node=4",
+        "ddp_train.py",
+        "--output_dir=model_outputs_ddp/",
         "--train_datasets_path=./raw_data/LSTM-Multivariate_pollution.csv",
         "--eval_datasets_path=./raw_data/pollution_test_data1.csv",
         "--seed=42",
         "--num_workers=12",
-        "--per_device_train_batch_size=32",
+        "--per_device_train_batch_size=8",
         "--per_device_eval_batch_size=1",
         "--accumulate_grad_batches=1",
         "--max_epochs=150",
@@ -28,6 +33,9 @@
         "--warmup_ratio=0.01",
         "--div_factor=10",
         "--final_div_factor=10",
-        "--log_every_n=100"
+        "--dataloader_drop_last=False",
+        "--sampler_shuffle=True",
+        "--log_every_n=100",
+        "--model_dtype=fp16"
     ]
 }

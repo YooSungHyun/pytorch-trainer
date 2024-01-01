@@ -64,6 +64,7 @@ class Trainer:
             self.is_fp16 = True
         elif precision in ["bf16" or "bfloat16"]:
             self.precision = precision_dict["bf16"]
+            self.is_fp16 = True
         else:
             self.precision = precision_dict["fp32"]
 
@@ -134,6 +135,7 @@ class Trainer:
             "optimizer": optimizer,
             "scheduler_cfg": scheduler_cfg,
             "trainable_loss": trainable_loss,
+            "dtype": self.precision,
         }
 
         # load last checkpoint if available
@@ -150,7 +152,8 @@ class Trainer:
             train_loader.sampler.set_epoch(self.current_epoch)
             # if you think, each epoch's evaluation step is used another data at each device?
             # so, next line use
-            # val_loader.sampler.set_epoch(self.current_epoch)
+            val_loader.sampler.set_epoch(self.current_epoch)
+
             self.train_loop(
                 state["model"],
                 state["optimizer"],
@@ -232,7 +235,9 @@ class Trainer:
                 # optimizer step runs train step internally through closure
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
                 global_loss += loss
-                gl_list = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
+                gl_list = [
+                    torch.tensor([0], dtype=torch.float32, device=self.device) for _ in range(dist.get_world_size())
+                ]
                 dist.all_gather(gl_list, global_loss)
                 dist.barrier()
                 # gl_list = [gpu0 global_loss, gpu1 global_loss, gpu2, gpu3]
@@ -324,6 +329,8 @@ class Trainer:
 
         def on_validation_model_eval(model):
             model.eval()
+            # requires_grad = True, but loss.backward() raised error
+            # because grad_fn is None
             torch.set_grad_enabled(False)
 
         on_validation_model_eval(model)
@@ -354,10 +361,11 @@ class Trainer:
             on_validation_batch_start(batch, batch_idx)
 
             # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-            labels = batch.pop("labels")
+            with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
+                labels = batch.pop("labels")
 
-            outputs = model(**batch)
-            loss = self.criterion(outputs, labels)
+                outputs = model(**batch)
+                loss = self.criterion(outputs, labels)
 
             tot_batch_result.append(outputs)
             tot_batch_labels.append(labels)
@@ -371,7 +379,9 @@ class Trainer:
 
             on_validation_batch_end(outputs, batch, batch_idx)
 
-            loss_list = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
+            loss_list = [
+                torch.tensor([0], dtype=torch.float32, device=self.device) for _ in range(dist.get_world_size())
+            ]
             dist.all_gather(loss_list, self._current_val_return["loss"])
             dist.barrier()
 
@@ -450,7 +460,7 @@ class Trainer:
 
         """
         # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.is_fp16):
+        with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
             labels = batch.pop("labels")
 
             outputs = model(**batch)
@@ -471,7 +481,7 @@ class Trainer:
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
 
-        loss_list = [torch.tensor(0, dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
+        loss_list = [torch.tensor([0], dtype=torch.float32, device=self.device) for _ in range(dist.get_world_size())]
         dist.all_gather(loss_list, self._current_train_return["loss"])
         dist.barrier()
 
@@ -574,6 +584,17 @@ class Trainer:
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
 
+        if self.precision != state["dtype"]:
+            self.logger.warning(
+                f"Trainer precision {self.precision} not matched load state {state['dtype']} plz check!!!!!!"
+            )
+            self.precision = state["dtype"]
+            self.is_fp16 = False
+            if self.precision in [torch.float16, torch.bfloat16]:
+                self.is_fp16 = True
+
+            self.grad_scaler = GradScaler(enabled=self.is_fp16)
+
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")
 
@@ -589,7 +610,9 @@ class Trainer:
         if state is None:
             state = {}
 
-        state.update(global_step=self.global_step, current_epoch=self.current_epoch, step=self.step)
+        state.update(
+            global_step=self.global_step, current_epoch=self.current_epoch, step=self.step, dtype=self.precision
+        )
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         save_checkpoint(
             **state,

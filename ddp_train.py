@@ -142,8 +142,8 @@ def main(hparams: TrainingArguments):
     model = Net().cuda(device_id)
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
 
-    # if device_id == 0:
-    #     web_logger.watch(model, log_freq=hparams.log_every_n)
+    if device_id == 0:
+        web_logger.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -242,6 +242,7 @@ def main(hparams: TrainingArguments):
 
     trainer = Trainer(
         device_id=device_id,
+        precision=hparams.model_dtype,
         cmd_logger=logger,
         web_logger=web_logger,
         max_epochs=hparams.max_epochs,

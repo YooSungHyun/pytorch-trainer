@@ -42,3 +42,4 @@ class TrainingArguments:
     dataloader_drop_last: bool = False
     sampler_shuffle: bool = True
     max_norm: float = 0.0  # gradient clipping max_norm value
+    model_dtype: str = "fp32"

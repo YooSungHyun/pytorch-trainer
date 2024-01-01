@@ -327,6 +327,7 @@ def save_checkpoint(
     current_epoch: int,
     global_step: int,
     step: int,
+    dtype: torch.dtype,
     checkpoint_filepath: str,
     trainable_loss=None,
     logger=None,
@@ -372,6 +373,7 @@ def save_checkpoint(
             "optimizer": optimizer_state_dict,
             "scheduler": scheduler_state_dict,
             "trainable_loss": loss_state_dict,
+            "dtype": dtype,
         },
         checkpoint_filepath,
     )
@@ -416,6 +418,14 @@ def load_checkpoint(
     # step
     step = checkpoint_dict["step"] if "step" in checkpoint_dict.keys() and checkpoint_dict["step"] is not None else 0
     state.update({"step": step})
+
+    # dtype
+    dtype = (
+        checkpoint_dict["dtype"]
+        if "dtype" in checkpoint_dict.keys() and checkpoint_dict["dtype"] is not None
+        else torch.float32
+    )
+    state.update({"dtype": dtype})
 
     # optimizer
     if (

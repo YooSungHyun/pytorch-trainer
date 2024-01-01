@@ -300,6 +300,7 @@ class Trainer:
         tot_batch_result = list()
         tot_batch_labels = list()
         for batch_idx, batch in enumerate(iterable):
+            tensor_dict_to_device(batch, "cpu", non_blocking=self.non_blocking)
             # end epoch if stopping training completely or max batches for this epoch reached
             if self.should_stop or batch_idx >= limit_batches:
                 break
@@ -343,8 +344,8 @@ class Trainer:
             eval_step += 1
 
         def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
-            tot_batch_result = torch.stack(tot_batch_result)
-            tot_batch_labels = torch.stack(tot_batch_labels)
+            tot_batch_result = torch.cat(tot_batch_result, dim=0)
+            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
             epoch_loss = self.criterion(tot_batch_result, tot_batch_labels)
             epoch_rmse = torch.sqrt(epoch_loss)
             # epoch monitoring is must doing every epoch
