@@ -1,6 +1,6 @@
 #!/bin/bash
 export WANDB_DISABLED=false
-export WANDB_PROJECT="pytorch-trainer"
+export WANDB_PROJECT="torch-trainer"
 export WANDB_ENTITY=""
 export WANDB_NAME="cpu-lstm"
 

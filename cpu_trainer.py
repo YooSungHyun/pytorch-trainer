@@ -51,12 +51,8 @@ class Trainer:
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
         """
-        if precision in ["fp16", "float16"]:
-            self.precision = precision_dict["fp16"]
-        elif precision in ["bf16" or "bfloat16"]:
-            self.precision = precision_dict["bf16"]
-        else:
-            self.precision = precision_dict["fp32"]
+        assert precision in ["fp32", "float32"], "cpu mode only support float32 training"
+        self.precision = precision_dict["fp32"]
 
         self.logger = cmd_logger
         self.web_logger = web_logger
@@ -121,6 +117,7 @@ class Trainer:
             "optimizer": optimizer,
             "scheduler_cfg": scheduler_cfg,
             "trainable_loss": trainable_loss,
+            "dtype": self.precision,
         }
 
         # load last checkpoint if available
@@ -288,6 +285,7 @@ class Trainer:
         def on_validation_model_eval(model):
             model.eval()
             # requires_grad = True, but loss.backward() raised error
+            # because grad_fn is None
             torch.set_grad_enabled(False)
 
         on_validation_model_eval(model)
@@ -328,7 +326,7 @@ class Trainer:
                 pass
 
             on_validation_batch_end(outputs, batch, batch_idx)
-            self._current_val_return = outputs
+
             web_log_every_n(
                 self.web_logger,
                 {
@@ -391,6 +389,7 @@ class Trainer:
         outputs = {"loss": loss}
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
+
         web_log_every_n(
             self.web_logger,
             {
@@ -489,6 +488,8 @@ class Trainer:
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
 
+        assert self.precision == state["dtype"], "cpu only support float32 training!!!"
+
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned")
 
@@ -504,7 +505,9 @@ class Trainer:
         if state is None:
             state = {}
 
-        state.update(global_step=self.global_step, current_epoch=self.current_epoch, step=self.step)
+        state.update(
+            global_step=self.global_step, current_epoch=self.current_epoch, step=self.step, dtype=self.precision
+        )
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         save_checkpoint(
             **state,

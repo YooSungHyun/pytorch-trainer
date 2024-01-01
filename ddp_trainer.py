@@ -235,7 +235,6 @@ class Trainer:
                 # optimizer step runs train step internally through closure
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
                 global_loss += loss
-                # gl_list = [gpu0 global_loss, gpu1 global_loss, gpu2, gpu3]
                 mean_global_loss = global_loss / self.grad_accum_steps
                 # global_step loss check
                 web_log_every_n(

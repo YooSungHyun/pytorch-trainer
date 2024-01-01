@@ -2,7 +2,7 @@
 export OMP_NUM_THREADS=8
 export CUDA_LAUNCH_BLOCKING=1
 export WANDB_DISABLED=false
-export WANDB_PROJECT="pytorch-trainer"
+export WANDB_PROJECT="torch-trainer"
 export WANDB_ENTITY=""
 export WANDB_NAME="ddp-lstm"
 export CUDA_VISIBLE_DEVICES="0"
