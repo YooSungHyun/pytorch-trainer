@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 
 def dataclass_to_namespace(args, args_name):

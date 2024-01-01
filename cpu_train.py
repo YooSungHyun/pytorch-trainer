@@ -128,7 +128,7 @@ def main(hparams: TrainingArguments):
 
     # Instantiate objects
     model = Net()
-    wandb.watch(model, log_freq=hparams.log_every_n)
+    web_logger.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -155,9 +155,9 @@ def main(hparams: TrainingArguments):
         )
     else:
         # custom_train_sampler = SequentialSampler(train_dataset)
-        # custom_eval_sampler = SequentialSampler(eval_dataset)
+        custom_eval_sampler = SequentialSampler(eval_dataset)
         custom_train_sampler = RandomSampler(train_dataset, generator=generator)
-        custom_eval_sampler = RandomSampler(eval_dataset, generator=generator)
+        # custom_eval_sampler = RandomSampler(eval_dataset, generator=generator)
 
     # If 1 device for training, sampler suffle True and dataloader shuffle True is same meaning
     train_dataloader = CustomDataLoader(
@@ -180,11 +180,9 @@ def main(hparams: TrainingArguments):
         drop_last=hparams.dataloader_drop_last,
     )
 
-    if hparams.dataloader_drop_last:
-        # if last batch data drop, that is same to floor
-        steps_per_epoch = math.floor(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
-    else:
-        steps_per_epoch = math.ceil(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
+    # dataloader already calculate total_data / batch_size
+    # accumulation is always floor
+    train_steps_per_epoch = math.floor(len(train_dataloader) / (hparams.accumulate_grad_batches))
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -192,7 +190,7 @@ def main(hparams: TrainingArguments):
         pct_start=hparams.warmup_ratio,
         epochs=hparams.max_epochs,
         final_div_factor=hparams.final_div_factor,
-        steps_per_epoch=steps_per_epoch,
+        steps_per_epoch=train_steps_per_epoch,
     )
 
     # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
@@ -230,7 +228,6 @@ def main(hparams: TrainingArguments):
         web_logger=web_logger,
         max_epochs=hparams.max_epochs,
         grad_accum_steps=hparams.accumulate_grad_batches,
-        total_global_step=steps_per_epoch,
         chk_addr_dict=chk_addr_dict,
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,

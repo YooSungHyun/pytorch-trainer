@@ -15,7 +15,6 @@ class Trainer:
     def __init__(
         self,
         device_id,
-        total_global_step: int,
         precision="fp32",
         cmd_logger=None,
         web_logger=None,
@@ -70,7 +69,6 @@ class Trainer:
 
         self.global_step = 0
         self.step = 0
-        self.total_global_step = total_global_step
         self.grad_accum_steps: int = grad_accum_steps
         self.current_epoch = 0
 
@@ -141,6 +139,10 @@ class Trainer:
 
         self.criterion = criterion
         while not self.should_stop:
+            train_loader.sampler.set_epoch(self.current_epoch)
+            # if you think, each epoch's evaluation step is used another data at each device?
+            # so, next line use
+            # val_loader.sampler.set_epoch(self.current_epoch)
             self.train_loop(
                 state["model"],
                 state["optimizer"],
@@ -160,7 +162,8 @@ class Trainer:
             if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
                 self.should_stop = True
 
-            self.save(state)
+            if self.device_id == 0:
+                self.save(state)
 
         # reset for next fit call
         self.should_stop = False
@@ -191,7 +194,7 @@ class Trainer:
         on_train_epoch_start()
         if self.device_id == 0:
             iterable = self.progbar_wrapper(
-                train_loader, total=min(self.total_global_step, limit_batches), desc=f"Epoch {self.current_epoch}"
+                train_loader, total=min(len(train_loader), limit_batches), desc=f"Epoch {self.current_epoch}"
             )
             pbar = enumerate(iterable)
         else:
@@ -200,7 +203,6 @@ class Trainer:
         # CPU trainer data size: 1369 (1 accum)
         # DDP trainer data size: 1369/4 = drop last false: 343, drop last true: 342
         for batch_idx, batch in pbar:
-            train_loader.sampler.set_epoch(self.current_epoch)
             tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
             # end epoch if stopping training completely or max batches for this epoch reached
             if self.should_stop or batch_idx >= limit_batches:
@@ -222,7 +224,13 @@ class Trainer:
                 # optimizer step runs train step internally through closure
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
                 global_loss += loss
-                mean_global_loss = global_loss / self.grad_accum_steps
+                gl_list = [
+                    torch.LongTensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())
+                ]
+                dist.all_gather(gl_list, global_loss)
+                dist.barrier()
+                # gl_list = [gpu0 global_loss, gpu1 global_loss, gpu2, gpu3]
+                mean_global_loss = sum(gl_list) / self.grad_accum_steps
                 # global_step loss check
                 web_log_every_n(
                     self.web_logger,
@@ -267,7 +275,8 @@ class Trainer:
                 self.step_scheduler(scheduler_cfg, level="step", current_value=self.global_step)
 
             # add output values to progress bar
-            self._format_iterable(iterable, self._current_train_return, "train")
+            if self.device_id == 0:
+                self._format_iterable(iterable, self._current_train_return, "train")
             self.step += 1
             # only increase global step if optimizer stepped
             self.global_step += int(should_optim_step)
@@ -301,24 +310,27 @@ class Trainer:
         if val_loader is None:
             return
 
-        def on_validation_model_eval():
-            pass
+        def on_validation_model_eval(model):
+            torch.set_grad_enabled(False)
+            model.eval()
 
-        torch.set_grad_enabled(False)
+        on_validation_model_eval(model)
 
         def on_validation_epoch_start():
             pass
 
-        iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
+        if self.device_id == 0:
+            iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
+            pbar = enumerate(iterable)
+        else:
+            pbar = enumerate(val_loader)
+
         eval_step = 0
         tot_batch_result = list()
         tot_batch_labels = list()
-        for batch_idx, batch in enumerate(iterable):
+        for batch_idx, batch in pbar:
+            tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
             # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
-
-            # if you think, each epoch's evaluation step is used another data at each device?
-            # so, next line use
-            # val_loader.sampler.set_epoch(self.current_epoch)
 
             # end epoch if stopping training completely or max batches for this epoch reached
             if self.should_stop or batch_idx >= limit_batches:
@@ -359,35 +371,41 @@ class Trainer:
                 self.log_every_n,
                 self.device_id,
             )
-            self._format_iterable(iterable, self._current_val_return, "val")
+            if self.device_id == 0:
+                self._format_iterable(iterable, self._current_val_return, "val")
             eval_step += 1
 
         def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
-            tot_batch_result = torch.stack(tot_batch_result)
-            tot_batch_labels = torch.stack(tot_batch_labels)
+            tot_batch_result = torch.cat(tot_batch_result, dim=0)
+            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
 
-            # 전체의 length를 일단 감안해본다.
-            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long).to(self.device)
-            size_list = [torch.tensor([0], dtype=torch.long).to(self.device) for _ in range(dist.get_world_size())]
+            # all_gather` requires a `fixed length tensor` as input.
+            # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
+            local_size = torch.LongTensor([tot_batch_result.size(0)], dtype=torch.long, device=self.device)
+            size_list = [
+                torch.LongTensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())
+            ]
             dist.all_gather(size_list, local_size)
+            dist.barrier()
 
-            # drop_last 영향으로 길이가 달라질 수도 있고해서, 일일이 길이를 구한다음에 처리해야한다.
+            # Create a fixed length tensor with the length of `all_gather`.
             result_gathered_data = [
-                torch.zeros(
-                    (size.item(), tot_batch_result.size(1), tot_batch_result.size(2)), dtype=tot_batch_result.dtype
-                )
+                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype).cuda(self.device)
                 for size in size_list
             ]
             labels_gathered_data = [
-                torch.zeros(
-                    (size.item(), tot_batch_labels.size(1), tot_batch_labels.size(2)), dtype=tot_batch_labels.dtype
-                )
+                torch.zeros((size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype).cuda(self.device)
                 for size in size_list
             ]
-            # 모든 프로세스의 데이터를 수집
+
+            # Collect and match data from all GPUs.
             dist.all_gather(result_gathered_data, tot_batch_result)
             dist.all_gather(labels_gathered_data, tot_batch_labels)
+            dist.barrier()
 
+            # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
+            result_gathered_data = torch.cat(result_gathered_data, dim=0)
+            labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
             epoch_loss = self.criterion(result_gathered_data, labels_gathered_data)
             epoch_rmse = torch.sqrt(epoch_loss)
             # epoch monitoring is must doing every epoch
@@ -401,11 +419,11 @@ class Trainer:
 
         on_validation_epoch_end(tot_batch_result, tot_batch_labels)
 
-        def on_validation_model_train():
-            pass
+        def on_validation_model_train(model):
+            torch.set_grad_enabled(True)
+            model.train()
 
-        on_validation_model_train()
-        torch.set_grad_enabled(True)
+        on_validation_model_train(model)
 
     def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:
         """A single training step, running forward and backward. The optimizer step is called separately, as this is
@@ -437,6 +455,11 @@ class Trainer:
         outputs = {"loss": loss}
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
+
+        loss_list = [torch.tensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
+        dist.all_gather(loss_list, outputs["loss"])
+        dist.barrier()
+
         web_log_every_n(
             self.web_logger,
             {

@@ -39,6 +39,7 @@ def main(hparams: TrainingArguments):
     logger.info(f"Start running basic DDP example on rank {rank}.")
 
     device_id = rank % torch.cuda.device_count()
+    torch.cuda.set_device(device_id)
 
     # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
     setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
@@ -138,9 +139,11 @@ def main(hparams: TrainingArguments):
     # eval_dataset = PandasDataset(eval_df, length_column_name=hparams.length_column_name)
 
     # Instantiate objects
-    model = Net().to(device_id)
+    model = Net().cuda(device_id)
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
-    wandb.watch(model, log_freq=hparams.log_every_n)
+
+    # if device_id == 0:
+    #     web_logger.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -170,9 +173,7 @@ def main(hparams: TrainingArguments):
         custom_train_sampler = DistributedSampler(
             train_dataset, seed=hparams.seed, rank=device_id, shuffle=hparams.sampler_shuffle
         )
-        custom_eval_sampler = DistributedSampler(
-            eval_dataset, seed=hparams.seed, rank=device_id, shuffle=hparams.sampler_shuffle
-        )
+        custom_eval_sampler = DistributedSampler(eval_dataset, seed=hparams.seed, rank=device_id, shuffle=False)
 
     # DataLoader's shuffle: one device get random indices dataset in every epoch
     # example np_dataset is already set (feature)7:1(label), so, it can be all shuffle `True` between sampler and dataloader
@@ -196,11 +197,9 @@ def main(hparams: TrainingArguments):
         drop_last=hparams.dataloader_drop_last,
     )
 
-    if hparams.dataloader_drop_last:
-        # if last batch data drop, that is same to floor
-        steps_per_epoch = math.floor(len(train_dataloader) / (dist.get_world_size() * hparams.accumulate_grad_batches))
-    else:
-        steps_per_epoch = math.ceil(len(train_dataloader) / (dist.get_world_size() * hparams.accumulate_grad_batches))
+    # dataloader already calculate len(total_data) / (batch_size * dist.get_world_size())
+    # accumulation is always floor
+    steps_per_epoch = math.floor(len(train_dataloader) / hparams.accumulate_grad_batches)
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -247,7 +246,6 @@ def main(hparams: TrainingArguments):
         web_logger=web_logger,
         max_epochs=hparams.max_epochs,
         grad_accum_steps=hparams.accumulate_grad_batches,
-        total_global_step=steps_per_epoch,
         chk_addr_dict=chk_addr_dict,
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,
