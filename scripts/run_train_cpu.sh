@@ -14,7 +14,6 @@ python ./cpu_train.py \
     --per_device_eval_batch_size=1 \
     --accumulate_grad_batches=1 \
     --max_epochs=150 \
-    --log_every_n_steps=1 \
     --learning_rate=0.001 \
     --weight_decay=0.0001 \
     --warmup_ratio=0.01 \
