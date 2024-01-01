@@ -185,6 +185,8 @@ def main(hparams: TrainingArguments):
         sampler=custom_train_sampler,
         num_workers=hparams.num_workers,
         drop_last=hparams.dataloader_drop_last,
+        pin_memory=True,
+        persistent_workers=True,
     )
 
     eval_dataloader = CustomDataLoader(
@@ -195,6 +197,8 @@ def main(hparams: TrainingArguments):
         sampler=custom_eval_sampler,
         num_workers=hparams.num_workers,
         drop_last=hparams.dataloader_drop_last,
+        pin_memory=True,
+        persistent_workers=True,
     )
 
     # dataloader already calculate len(total_data) / (batch_size * dist.get_world_size())

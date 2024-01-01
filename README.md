@@ -83,3 +83,6 @@ I don't have much understanding of accelerate, so I'm looking for someone to hel
 Bugfixes and improvements are always welcome.
 
 **If you can recommend any accelerator related blogs or videos for me to study, I would be grateful. (in issue or someting)**
+
+# Special Thanks!
+[@jp1924](https://github.com/jp1924) [@ddobokki](https://github.com/ddobokki) [@Master_yang](https://github.com/effortprogrammer)
