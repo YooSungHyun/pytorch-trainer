@@ -211,7 +211,7 @@ def main(hparams: TrainingArguments):
         "trainable_loss": id(trainable_loss),
     }
 
-    log_str = f"""##########################################
+    log_str = f"""\n##########################################
     train_dataloader addr: {chk_addr_dict["train_dataloader"]}
     eval_dataloader addr: {chk_addr_dict["eval_dataloader"]}
     model addr: {chk_addr_dict["model"]}
@@ -221,7 +221,7 @@ def main(hparams: TrainingArguments):
     scheduler addr: {chk_addr_dict["scheduler_cfg[scheduler]"]}
     ##########################################
     """
-    logger.info(log_str)
+    logger.debug(log_str)
 
     trainer = Trainer(
         precision=hparams.model_dtype,
