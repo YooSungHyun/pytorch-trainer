@@ -50,10 +50,12 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 8. `cd {your-workpsace}/pytorch-trainer` & `sh scripts/run_train_[cpu|ddp|deepseed].sh`
 # TODO LIST
 
+each test wandb is here (Link)[https://wandb.ai/bart_tadev/torch-trainer?workspace=user-bart_tadev]
+
 -   [x] cpu_trainer - lstm example, but it training is weird
 -   [x] cpu_trainer - wandb
 -   [x] cpu_trainer - continuous learning
--   [x] cpu_trainer - weird lstm training fix ([wandb](https://wandb.ai/bart_tadev/torch-trainer/runs/jmnr1pcf?workspace=user-bart_tadev))
+-   [x] cpu_trainer - weird lstm training fix
 -   [x] ddp_trainer - lstm or mnist example
 -   [x] ddp_trainer - sampler and dataloader
 -   [x] ddp_trainer - training loop additional process?(for distributed learning)
@@ -65,12 +67,14 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 -   [ ] deepspeed_trainer - training loop additional process?(for distributed learning)
 -   [ ] deepspeed_trainer - wandb have to using gather or something?
 -   [ ] deepspeed_trainer - Reliable wandb logging for distributed learning
+-   [ ] inference - ipynb, py3
+-   [ ] huggingface - float16 model is real model dtype is float16? check and applied
 
 # Unsupported list
 
 **tensorboard** - I personally find it too inconvenient.
 
-fsdp - deepspeed is more comfortable for me... ( **I'll consider this if I get more requests**).
+**fsdp** - deepspeed is more comfortable for me... ( **I'll consider this if I get more requests**).
 
 # plz help!!!
 
