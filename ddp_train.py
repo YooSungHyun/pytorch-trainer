@@ -42,7 +42,9 @@ def main(hparams: TrainingArguments):
 
     # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
     setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
-    web_logger = wandb.init(config=hparams)
+    web_logger = None
+    if device_id == 0:
+        web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
     os.makedirs(hparams.output_dir, exist_ok=True)
 
@@ -182,7 +184,6 @@ def main(hparams: TrainingArguments):
         sampler=custom_train_sampler,
         num_workers=hparams.num_workers,
         drop_last=hparams.dataloader_drop_last,
-        shuffle=hparams.dataloader_shuffle,
     )
 
     eval_dataloader = CustomDataLoader(
@@ -193,7 +194,6 @@ def main(hparams: TrainingArguments):
         sampler=custom_eval_sampler,
         num_workers=hparams.num_workers,
         drop_last=hparams.dataloader_drop_last,
-        shuffle=hparams.dataloader_shuffle,
     )
 
     if hparams.dataloader_drop_last:
@@ -262,10 +262,10 @@ def main(hparams: TrainingArguments):
         val_loader=eval_dataloader,
         ckpt_path=hparams.output_dir,
         trainable_loss=trainable_loss,
-        wandb_upload_wait=300,
     )
 
-    web_logger.finish(exit_code=0)
+    if device_id == 0:
+        web_logger.finish(exit_code=0)
 
 
 if __name__ == "__main__":
