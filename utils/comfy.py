@@ -481,3 +481,8 @@ def tensor_dict_to_device(tensor_dict: Dict[str, torch.Tensor], device: str = "c
             tensor_dict[k] = v.to(device, non_blocking=non_blocking)
         else:
             raise TypeError(f"value of dict is not torch.Tensor. Found {type(v)}")
+
+
+def web_log_every_n(logger, log_item: dict, n: int, log_every_n: int, rank: int = 0):
+    if n % log_every_n == 0 and rank == 0:
+        logger.log(log_item)

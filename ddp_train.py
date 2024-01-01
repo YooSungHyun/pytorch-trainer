@@ -250,6 +250,7 @@ def main(hparams: TrainingArguments):
         total_global_step=steps_per_epoch,
         chk_addr_dict=chk_addr_dict,
         checkpoint_dir=hparams.output_dir,
+        log_every_n=hparams.log_every_n,
     )
 
     trainer.fit(
@@ -263,6 +264,8 @@ def main(hparams: TrainingArguments):
         trainable_loss=trainable_loss,
         wandb_upload_wait=300,
     )
+
+    web_logger.finish(exit_code=0)
 
 
 if __name__ == "__main__":

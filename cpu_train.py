@@ -159,7 +159,7 @@ def main(hparams: TrainingArguments):
         custom_train_sampler = RandomSampler(train_dataset, generator=generator)
         custom_eval_sampler = RandomSampler(eval_dataset, generator=generator)
 
-    # If 1 device for training, sampler suffle True and dataloader shuffle True is same Meaning
+    # If 1 device for training, sampler suffle True and dataloader shuffle True is same meaning
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
         feature_column_name=hparams.feature_column_name,
@@ -235,6 +235,7 @@ def main(hparams: TrainingArguments):
         total_global_step=steps_per_epoch,
         chk_addr_dict=chk_addr_dict,
         checkpoint_dir=hparams.output_dir,
+        log_every_n=hparams.log_every_n,
     )
 
     trainer.fit(
@@ -248,6 +249,8 @@ def main(hparams: TrainingArguments):
         trainable_loss=trainable_loss,
         wandb_upload_wait=600,
     )
+
+    web_logger.finish(exit_code=0)
 
 
 if __name__ == "__main__":

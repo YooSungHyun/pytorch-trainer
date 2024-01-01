@@ -4,7 +4,7 @@ from functools import partial
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
 import time
 import torch
-from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device
+from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
 import torch.distributed as dist
 
@@ -30,6 +30,7 @@ class Trainer:
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
         non_blocking: bool = True,
+        log_every_n: int = 1,
     ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
@@ -97,6 +98,7 @@ class Trainer:
         self.checkpoint_frequency = checkpoint_frequency
 
         self.non_blocking = non_blocking
+        self.log_every_n = log_every_n
 
     def fit(
         self,
@@ -225,15 +227,18 @@ class Trainer:
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
                 global_loss += loss
                 mean_global_loss = global_loss / self.grad_accum_steps
-                if self.device_id == 0:
-                    self.web_logger.log(
-                        {
-                            "train/global_step_loss": mean_global_loss,
-                            "train/global_step": self.global_step,
-                            "train/step": self.step,
-                            "train/epoch": self.current_epoch,
-                        }
-                    )
+                # global_step loss check
+                web_log_every_n(
+                    self.web_logger,
+                    {
+                        "train/global_step_loss": mean_global_loss,
+                        "train/global_step": self.global_step,
+                        "train/epoch": self.current_epoch,
+                    },
+                    self.global_step,
+                    self.log_every_n,
+                    self.device_id,
+                )
                 optimizer.step()
 
                 def on_before_zero_grad(optimizer):
@@ -252,13 +257,16 @@ class Trainer:
             on_train_batch_end(self._current_train_return, batch, batch_idx)
             # this guard ensures, we only step the scheduler once per global step
             if should_optim_step:
-                self.web_logger.log(
+                web_log_every_n(
+                    self.web_logger,
                     {
                         "train/optim_0_learning_rate": optimizer.param_groups[0]["lr"],
                         "train/global_step": self.global_step,
-                        "train/step": self.step,
                         "train/epoch": self.current_epoch,
-                    }
+                    },
+                    self.global_step,
+                    self.log_every_n,
+                    self.device_id,
                 )
                 self.step_scheduler(scheduler_cfg, level="step", current_value=self.global_step)
 
@@ -343,15 +351,18 @@ class Trainer:
 
             on_validation_batch_end(outputs, batch, batch_idx)
             self._current_val_return = outputs
-            if self.device_id == 0:
-                self.web_logger.log(
-                    {
-                        "eval_step/loss": self._current_val_return["loss"],
-                        "eval_step/step": eval_step,
-                        "eval_step/global_step": self.global_step,
-                        "eval_step/epoch": self.current_epoch,
-                    }
-                )
+            web_log_every_n(
+                self.web_logger,
+                {
+                    "eval_step/loss": self._current_val_return["loss"],
+                    "eval_step/step": eval_step,
+                    "eval_step/global_step": self.global_step,
+                    "eval_step/epoch": self.current_epoch,
+                },
+                eval_step,
+                self.log_every_n,
+                self.device_id,
+            )
             self._format_iterable(iterable, self._current_val_return, "val")
             eval_step += 1
 
@@ -383,8 +394,14 @@ class Trainer:
 
             epoch_loss = self.criterion(result_gathered_data, labels_gathered_data)
             epoch_rmse = torch.sqrt(epoch_loss)
-            if self.device_id == 0:
-                self.web_logger.log({"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch})
+            # epoch monitoring is must doing every epoch
+            web_log_every_n(
+                self.web_logger,
+                {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch},
+                self.current_epoch,
+                1,
+                self.device_id,
+            )
 
         on_validation_epoch_end(tot_batch_result, tot_batch_labels)
 
@@ -424,15 +441,18 @@ class Trainer:
         outputs = {"loss": loss}
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
-        if self.device_id == 0:
-            self.web_logger.log(
-                {
-                    "train/loss": self._current_train_return["loss"],
-                    "train/step": self.step,
-                    "train/global_step": self.global_step,
-                    "train/epoch": self.current_epoch,
-                }
-            )
+        web_log_every_n(
+            self.web_logger,
+            {
+                "train/loss": self._current_train_return["loss"],
+                "train/step": self.step,
+                "train/global_step": self.global_step,
+                "train/epoch": self.current_epoch,
+            },
+            self.step,
+            self.log_every_n,
+            self.device_id,
+        )
         return loss
 
     def step_scheduler(

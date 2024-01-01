@@ -35,7 +35,7 @@ class TrainingArguments:
     group_by_length: bool = False
     accumulate_grad_batches: int = 1
     max_epochs: int = 1
-    log_every_n_steps: int = 1
+    log_every_n: int = 1
     length_column_name: str = None
     feature_column_name: str = "raw_inputs"
     labels_column_name: str = "raw_labels"
