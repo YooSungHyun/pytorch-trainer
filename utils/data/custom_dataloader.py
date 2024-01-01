@@ -26,6 +26,8 @@ class CustomDataLoader(torch.utils.data.DataLoader):
             labels.append(torch.FloatTensor(batch[i][self.labels_column_name]))
 
         # if you neeed to many inputs, plz change this line
+        # TODO(User): `inputs` must match the input argument of the model exactly (the current example only utilizes `inputs`).
         _returns = {"inputs": torch.stack(inputs), "labels": torch.stack(labels)}
+        # _returns = {"input_ids", "attention_mask", "input_type_ids", "labels"}
 
         return _returns

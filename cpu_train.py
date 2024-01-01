@@ -97,24 +97,34 @@ def main(hparams: TrainingArguments):
         "X_test shape : {}      y_test shape : {} ".format(x_train.shape, y_train.shape, x_test.shape, y_test.shape)
     )
 
-    train_dataset = NumpyDataset(x_train, y_train)
-    eval_dataset = NumpyDataset(x_test, y_test)
+    train_dataset = NumpyDataset(
+        x_train,
+        y_train,
+        feature_column_name=hparams.feature_column_name,
+        labels_column_name=hparams.labels_column_name,
+    )
+    eval_dataset = NumpyDataset(
+        x_test,
+        y_test,
+        feature_column_name=hparams.feature_column_name,
+        labels_column_name=hparams.labels_column_name,
+    )
     # if hparams.eval_datasets_path:
     #     eval_df = pd.read_csv(hparams.eval_datasets_path)
-    #     train_dataset = PandasDataset(train_df, length_column=hparams.length_column)
+    #     train_dataset = PandasDataset(train_df, length_column_name=hparams.length_column_name)
     # else:
     #     # it is just for lstm example
     #     train_df = train_df[::-1]
     #     train_size = int(len(train_df) * hparams.train_data_ratio)
     #     splited_train_df = train_df[0:train_size]
     #     eval_df = train_df[train_size - seq_length :]
-    #     train_dataset = PandasDataset(splited_train_df, length_column=hparams.length_column)
+    #     train_dataset = PandasDataset(splited_train_df, length_column_name=hparams.length_column_name)
     #     # if you use another one, plz check here
     #     # train_size = int(hparams.train_data_ratio * len(train_df))
     #     # eval_size = len(train_df) - train_size
     #     # train_dataset = PandasDataset(hparams.train_datasets_path)
     #     # train_dataset, eval_dataset = random_split(train_dataset, [train_size, eval_size])
-    # eval_dataset = PandasDataset(eval_df, length_column=hparams.length_column)
+    # eval_dataset = PandasDataset(eval_df, length_column_name=hparams.length_column_name)
 
     # Instantiate objects
     model = Net()
@@ -134,13 +144,13 @@ def main(hparams: TrainingArguments):
         custom_train_sampler = LengthGroupedSampler(
             batch_size=hparams.batch_size,
             dataset=train_dataset,
-            model_input_name=train_dataset.length_column,
+            model_input_name=train_dataset.length_column_name,
             generator=generator,
         )
         custom_eval_sampler = LengthGroupedSampler(
             batch_size=hparams.batch_size,
             dataset=eval_dataset,
-            model_input_name=eval_dataset.length_column,
+            model_input_name=eval_dataset.length_column_name,
             generator=generator,
         )
     else:
@@ -151,23 +161,32 @@ def main(hparams: TrainingArguments):
 
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
-        feature_column_name="inputs",
+        feature_column_name=hparams.feature_column_name,
         labels_column_name=hparams.labels_column_name,
         batch_size=hparams.per_device_train_batch_size,
         sampler=custom_train_sampler,
         num_workers=hparams.num_workers,
+        drop_last=hparams.dataloader_drop_last,
+        shuffle=hparams.dataloader_shuffle,
     )
 
     eval_dataloader = CustomDataLoader(
         dataset=eval_dataset,
-        feature_column_name="inputs",
+        feature_column_name=hparams.feature_column_name,
         labels_column_name=hparams.labels_column_name,
         batch_size=hparams.per_device_eval_batch_size,
         sampler=custom_eval_sampler,
         num_workers=hparams.num_workers,
+        drop_last=hparams.dataloader_drop_last,
+        shuffle=hparams.dataloader_shuffle,
     )
 
-    steps_per_epoch = math.ceil(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
+    if train_dataloader.dataloader_drop_last:
+        # if last batch data drop, that is same to floor
+        steps_per_epoch = math.floor(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
+    else:
+        steps_per_epoch = math.ceil(len(train_dataloader) / (1 * hparams.accumulate_grad_batches))
+
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=hparams.learning_rate,
@@ -176,6 +195,7 @@ def main(hparams: TrainingArguments):
         final_div_factor=hparams.final_div_factor,
         steps_per_epoch=steps_per_epoch,
     )
+
     # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
     lr_scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}
     assert id(scheduler) == id(lr_scheduler["scheduler"])
@@ -214,7 +234,6 @@ def main(hparams: TrainingArguments):
         total_global_step=steps_per_epoch,
         chk_addr_dict=chk_addr_dict,
         checkpoint_dir=hparams.output_dir,
-        labels_column_name=hparams.labels_column_name,
     )
 
     trainer.fit(

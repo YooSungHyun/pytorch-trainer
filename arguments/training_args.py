@@ -32,9 +32,12 @@ class TrainingArguments:
     drop_schedule: str = sp.field(
         default="constant", choices=["constant", "linear"]
     )  # drop schedule for early dropout / s.d. only
-    length_column: str = None
     group_by_length: bool = False
     accumulate_grad_batches: int = 1
     max_epochs: int = 1
     log_every_n_steps: int = 1
-    labels_column_name: str = "labels"
+    length_column_name: str = None
+    feature_column_name: str = "raw_inputs"
+    labels_column_name: str = "raw_labels"
+    dataloader_drop_last: bool = False
+    dataloader_shuffle: bool = True

@@ -12,12 +12,12 @@ class PandasDataset(CustomDataset):
         seq_length: int,
         transform: Callable = None,
         img_col: str = None,
-        length_column: str = None,
+        length_column_name: str = None,
     ):
         self.jsonl = dataframe.to_dict("records")
         self.transform = transform
         self.img_col = img_col
-        self.length_column = length_column
+        self.length_column_name = length_column_name
         self.seq_length = seq_length
 
     def __len__(self):
@@ -47,8 +47,8 @@ class PandasDataset(CustomDataset):
                 if self.transform:
                     items[i] = self.transform(items[i])
                 # you must get length after transform
-                if self.length_column:
-                    items[i].update({"lengths": len(items[i][self.length_column])})
+                if self.length_column_name:
+                    items[i].update({"lengths": len(items[i][self.length_column_name])})
                 # items[i] = self.json_to_tensor(items[i])
         else:
             if self.img_col and self.img_col in items.keys():
@@ -59,8 +59,8 @@ class PandasDataset(CustomDataset):
             if self.transform:
                 items[i] = self.transform(items[i])
             # you must get length after transform
-            if self.length_column:
-                items[i].update({"lengths": len(items[i][self.length_column])})
+            if self.length_column_name:
+                items[i].update({"lengths": len(items[i][self.length_column_name])})
             # items = self.json_to_tensor(items)
 
         return items

@@ -30,7 +30,6 @@ class Trainer:
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
         non_blocking: bool = True,
-        labels_column_name: str = "labels",
     ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
@@ -98,7 +97,6 @@ class Trainer:
         self.checkpoint_frequency = checkpoint_frequency
 
         self.non_blocking = non_blocking
-        self.labels_column_name = labels_column_name
 
     def fit(
         self,
@@ -326,7 +324,9 @@ class Trainer:
                 pass
 
             on_validation_batch_start(batch, batch_idx)
-            labels = batch.pop(self.labels_column_name)
+
+            # TODO(User): If you needs more labels than 1, must change this line (make your labels)
+            labels = batch.pop("labels")
 
             outputs = model(**batch)
             loss = self.criterion(outputs, labels)
@@ -404,7 +404,8 @@ class Trainer:
             batch_idx: index of the current batch w.r.t the current epoch
 
         """
-        labels = batch.pop(self.labels_column_name)
+        # TODO(User): If you needs more labels than 1, must change this line (make your labels)
+        labels = batch.pop("labels")
 
         outputs = model(**batch)
         loss = self.criterion(outputs, labels)

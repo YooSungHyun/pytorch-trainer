@@ -11,11 +11,16 @@ class NumpyDataset(CustomDataset):
         np_x: numpy.ndarray,
         np_y: numpy.ndarray,
         transform: Callable = None,
+        feature_column_name: str = "raw_inputs",
+        labels_column_name: str = "raw_labels",
     ):
         self.np_x = np_x
         self.np_y = np_y
         assert len(np_x) == len(np_y)
         self.transform = transform
+
+        self.feature_column_name = feature_column_name
+        self.labels_column_name = labels_column_name
 
     def __len__(self):
         return len(self.np_x)
@@ -40,4 +45,4 @@ class NumpyDataset(CustomDataset):
                 xs[i] = self.transform(xs[i])
             # items = self.json_to_tensor(items)
 
-        return {"inputs": xs, "labels": ys}
+        return {self.feature_column_name: xs, self.labels_column_name: ys}
