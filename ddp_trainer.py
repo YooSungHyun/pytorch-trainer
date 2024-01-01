@@ -414,11 +414,11 @@ class Trainer:
 
             # Create a fixed length tensor with the length of `all_gather`.
             result_gathered_data = [
-                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype).cuda(self.device)
+                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype, device=self.device)
                 for size in size_list
             ]
             labels_gathered_data = [
-                torch.zeros((size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype).cuda(self.device)
+                torch.zeros((size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype, device=self.device)
                 for size in size_list
             ]
 
