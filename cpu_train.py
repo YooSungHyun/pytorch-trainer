@@ -224,6 +224,7 @@ def main(hparams: TrainingArguments):
     logger.info(log_str)
 
     trainer = Trainer(
+        precision=hparams.model_dtype,
         cmd_logger=logger,
         web_logger=web_logger,
         max_epochs=hparams.max_epochs,
