@@ -128,7 +128,7 @@ def main(hparams: TrainingArguments):
 
     # Instantiate objects
     model = Net()
-    wandb.watch(model, log_freq=hparams.log_every_n_steps)
+    wandb.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -142,13 +142,13 @@ def main(hparams: TrainingArguments):
     generator.manual_seed(hparams.seed)
     if hparams.group_by_length:
         custom_train_sampler = LengthGroupedSampler(
-            batch_size=hparams.batch_size,
+            batch_size=hparams.per_device_train_batch_size,
             dataset=train_dataset,
             model_input_name=train_dataset.length_column_name,
             generator=generator,
         )
         custom_eval_sampler = LengthGroupedSampler(
-            batch_size=hparams.batch_size,
+            batch_size=hparams.per_device_eval_batch_size,
             dataset=eval_dataset,
             model_input_name=eval_dataset.length_column_name,
             generator=generator,
@@ -168,7 +168,6 @@ def main(hparams: TrainingArguments):
         sampler=custom_train_sampler,
         num_workers=hparams.num_workers,
         drop_last=hparams.dataloader_drop_last,
-        shuffle=hparams.dataloader_shuffle,
     )
 
     eval_dataloader = CustomDataLoader(
@@ -179,7 +178,6 @@ def main(hparams: TrainingArguments):
         sampler=custom_eval_sampler,
         num_workers=hparams.num_workers,
         drop_last=hparams.dataloader_drop_last,
-        shuffle=hparams.dataloader_shuffle,
     )
 
     if hparams.dataloader_drop_last:
@@ -247,7 +245,6 @@ def main(hparams: TrainingArguments):
         val_loader=eval_dataloader,
         ckpt_path=hparams.output_dir,
         trainable_loss=trainable_loss,
-        wandb_upload_wait=600,
     )
 
     web_logger.finish(exit_code=0)

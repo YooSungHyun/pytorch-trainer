@@ -110,7 +110,6 @@ class Trainer:
         val_loader: torch.utils.data.DataLoader,
         trainable_loss=None,
         ckpt_path: Optional[str] = None,
-        wandb_upload_wait: int = 0,
     ):
         """The main entrypoint of the trainer, triggering the actual training.
 
@@ -165,9 +164,6 @@ class Trainer:
 
         # reset for next fit call
         self.should_stop = False
-        # train is completed super fast, it can not upload final epoch's sometings
-        # so wait small second
-        time.sleep(wandb_upload_wait)
 
     def train_loop(
         self,

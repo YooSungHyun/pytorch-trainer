@@ -138,7 +138,7 @@ def main(hparams: TrainingArguments):
     # Instantiate objects
     model = Net().to(device_id)
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
-    wandb.watch(model, log_freq=hparams.log_every_n_steps)
+    wandb.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
