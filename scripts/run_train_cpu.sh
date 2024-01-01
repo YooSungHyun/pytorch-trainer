@@ -5,7 +5,7 @@ export WANDB_ENTITY=""
 export WANDB_NAME="cpu-lstm"
 
 python ./cpu_train.py \
-    --output_dir=model_outputs_cpu/ \
+    --output_dir=cpu_outputs/ \
     --train_datasets_path=./raw_data/LSTM-Multivariate_pollution.csv \
     --eval_datasets_path=./raw_data/pollution_test_data1.csv \
     --seed=42 \

@@ -8,7 +8,7 @@ export WANDB_NAME="ddp-lstm"
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 torchrun --master_port=25111 --nproc_per_node=4 ./ddp_train.py \
-    --output_dir="model_outputs_ddp/" \
+    --output_dir="ddp_outputs/" \
     --train_datasets_path="./raw_data/LSTM-Multivariate_pollution.csv" \
     --eval_datasets_path="./raw_data/pollution_test_data1.csv" \
     --seed=42 \

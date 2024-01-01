@@ -235,13 +235,8 @@ class Trainer:
                 # optimizer step runs train step internally through closure
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
                 global_loss += loss
-                gl_list = [
-                    torch.tensor([0], dtype=torch.float32, device=self.device) for _ in range(dist.get_world_size())
-                ]
-                dist.all_gather(gl_list, global_loss)
-                dist.barrier()
                 # gl_list = [gpu0 global_loss, gpu1 global_loss, gpu2, gpu3]
-                mean_global_loss = torch.sum(torch.cat(gl_list)) / self.grad_accum_steps
+                mean_global_loss = global_loss / self.grad_accum_steps
                 # global_step loss check
                 web_log_every_n(
                     self.web_logger,
@@ -348,6 +343,9 @@ class Trainer:
         tot_batch_result = list()
         tot_batch_labels = list()
         for batch_idx, batch in pbar:
+            # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,
+            # but it was not much different from outputting the value of GPU 0.
+            # Therefore, all sections except EVAL EPOCH END only output the value of rank 0.
             tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
             # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
 
@@ -379,16 +377,10 @@ class Trainer:
 
             on_validation_batch_end(outputs, batch, batch_idx)
 
-            loss_list = [
-                torch.tensor([0], dtype=torch.float32, device=self.device) for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(loss_list, self._current_val_return["loss"])
-            dist.barrier()
-
             web_log_every_n(
                 self.web_logger,
                 {
-                    "eval_step/loss": torch.mean(torch.cat(loss_list)),
+                    "eval_step/loss": self._current_val_return["loss"],
                     "eval_step/step": eval_step,
                     "eval_step/global_step": self.global_step,
                     "eval_step/epoch": self.current_epoch,
@@ -481,14 +473,10 @@ class Trainer:
         # avoid gradients in stored/accumulated values -> prevents potential OOM
         self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
 
-        loss_list = [torch.tensor([0], dtype=torch.float32, device=self.device) for _ in range(dist.get_world_size())]
-        dist.all_gather(loss_list, self._current_train_return["loss"])
-        dist.barrier()
-
         web_log_every_n(
             self.web_logger,
             {
-                "train/loss": torch.mean(torch.cat(loss_list)),
+                "train/loss": self._current_train_return["loss"],
                 "train/step": self.step,
                 "train/global_step": self.global_step,
                 "train/epoch": self.current_epoch,
