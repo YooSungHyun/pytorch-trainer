@@ -50,7 +50,7 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 8. `cd {your-workpsace}/pytorch-trainer` & `sh scripts/run_train_[cpu|ddp|deepseed].sh`
 # TODO LIST
 
-each test wandb is here (Link)[https://wandb.ai/bart_tadev/torch-trainer?workspace=user-bart_tadev]
+each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspace=user-bart_tadev)
 
 -   [x] cpu_trainer - lstm example, but it training is weird
 -   [x] cpu_trainer - wandb
