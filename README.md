@@ -62,12 +62,13 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [x] ddp_trainer - Reliable wandb logging for distributed learning
 -   [x] ddp_trainer - wandb have to using gather or something?
 -   [x] ddp_trainer - add fp16 and bf16 use
--   [ ] deepspeed_trainer - lstm or mnist example
--   [ ] deepspeed_trainer - sampler and dataloader
--   [ ] deepspeed_trainer - training loop additional process?(for distributed learning)
--   [ ] deepspeed_trainer - wandb have to using gather or something?
--   [ ] deepspeed_trainer - Reliable wandb logging for distributed learning
--   [ ] fsdp_trainer
+-   [x] deepspeed_trainer - lstm or mnist example
+-   [x] deepspeed_trainer - sampler and dataloader
+-   [x] deepspeed_trainer - training loop additional process?(for distributed learning)
+-   [x] deepspeed_trainer - wandb have to using gather or something?
+-   [x] deepspeed_trainer - Reliable wandb logging for distributed learning
+-   [ ] fsdp_trainer - change deepspeed to fsdp
+-   [ ] fsdp_trainer - test
 -   [ ] inference - ipynb, py3
 -   [ ] huggingface - float16 model is real model dtype is float16? check and applied
 
