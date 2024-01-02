@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import wandb
 from arguments.training_args import TrainingArguments
-from ddp_trainer import Trainer
+from trainer.ddp import Trainer
 from networks.models import Net
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser

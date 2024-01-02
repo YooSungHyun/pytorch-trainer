@@ -8,6 +8,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import json
+
+
+def json_to_dict(json_file_path):
+    with open(json_file_path, "r", encoding="utf-8") as file:
+        return json.load(file)
 
 
 def dataclass_to_namespace(args, args_name):
@@ -27,6 +33,22 @@ def seed_everything(random_seed: int) -> None:
     torch.backends.cudnn.benchmark = False
     np.random.seed(random_seed)
     random.seed(random_seed)
+
+
+def update_auto_nested_dict(d: dict, target_key: str, change_value: Union[str, int, list]):
+    """
+    Changes the value of all entries corresponding to the given key in a nested dictionary.
+
+    :param d: nested dictionary
+    :param target_key: want change key
+    :param change_value: want change value
+    :return: None (dictionary changed inplace)
+    """
+    for key, value in d.items():
+        if key == target_key and value == "auto":
+            d[key] = change_value
+        elif isinstance(value, dict):
+            update_auto_nested_dict(value, target_key, change_value)
 
 
 # Copyright The PyTorch Lightning team.
@@ -341,9 +363,10 @@ def save_checkpoint(
         global_step: global step.
         checkpoint_filepath: checkpoint filename including path.
     """
-
+    # assert os.path.isfile(checkpoint_filepath)
     if logger is not None:
         logger.info("Saving model and optimizer state at epoch {} to {}".format(current_epoch, checkpoint_filepath))
+
     if hasattr(model, "module"):
         state_dict = model.module.state_dict()
     else:
@@ -351,11 +374,17 @@ def save_checkpoint(
 
     optimizer_state_dict = None
     if optimizer is not None:
-        optimizer_state_dict = optimizer.state_dict()
+        if hasattr(optimizer, "module"):
+            optimizer_state_dict = optimizer.module.state_dict()
+        else:
+            optimizer_state_dict = optimizer.state_dict()
 
     scheduler_state_dict = None
     if scheduler_cfg["scheduler"] is not None:
-        scheduler_state_dict = scheduler_cfg["scheduler"].state_dict()
+        if hasattr(scheduler_cfg["scheduler"], "module"):
+            scheduler_state_dict = scheduler_cfg["scheduler"].module.state_dict()
+        else:
+            scheduler_state_dict = scheduler_cfg["scheduler"].state_dict()
 
     loss_state_dict = None
     if trainable_loss is not None:
@@ -364,19 +393,35 @@ def save_checkpoint(
         else:
             loss_state_dict = trainable_loss.state_dict()
 
-    torch.save(
-        {
-            "current_epoch": current_epoch,
-            "global_step": global_step,
-            "step": step,
-            "model": state_dict,
-            "optimizer": optimizer_state_dict,
-            "scheduler": scheduler_state_dict,
-            "trainable_loss": loss_state_dict,
-            "dtype": dtype,
-        },
-        checkpoint_filepath,
-    )
+    from deepspeed.runtime.engine import DeepSpeedEngine
+
+    if isinstance(model, DeepSpeedEngine):
+        model.save_checkpoint(
+            checkpoint_filepath,
+            client_state={
+                "current_epoch": current_epoch,
+                "global_step": global_step,
+                "step": step,
+                "scheduler": scheduler_state_dict,
+                "trainable_loss": loss_state_dict,
+                "dtype": dtype,
+            },
+        )
+        return
+    else:
+        torch.save(
+            {
+                "current_epoch": current_epoch,
+                "global_step": global_step,
+                "step": step,
+                "model": state_dict,
+                "optimizer": optimizer_state_dict,
+                "scheduler": scheduler_state_dict,
+                "trainable_loss": loss_state_dict,
+                "dtype": dtype,
+            },
+            checkpoint_filepath,
+        )
 
 
 def load_checkpoint(
@@ -396,90 +441,84 @@ def load_checkpoint(
     Returns:
         state: dict
     """
-    assert os.path.isfile(checkpoint_filepath)
-    checkpoint_dict = torch.load(checkpoint_filepath, map_location=device)
+    # from deepspeed.runtime.engine import DeepSpeedEngine
+
+    # assert os.path.isfile(checkpoint_filepath)
+    # if isinstance(state["model"], DeepSpeedEngine):
+    model_path, additional_state = state["model"].load_checkpoint(checkpoint_filepath)
+    # optimizer
+    state["optimizer"] = state["model"].optimizer
 
     # epoch
     current_epoch = (
-        checkpoint_dict["current_epoch"]
-        if ("current_epoch" in checkpoint_dict.keys() and checkpoint_dict["current_epoch"] is not None)
+        additional_state["current_epoch"]
+        if ("current_epoch" in additional_state.keys() and additional_state["current_epoch"] is not None)
         else 0
     )
     state.update({"current_epoch": current_epoch})
 
     # global_step
-    global_step = (
-        checkpoint_dict["global_step"]
-        if "global_step" in checkpoint_dict.keys() and checkpoint_dict["global_step"] is not None
-        else 0
-    )
-    state.update({"global_step": global_step})
+    assert state["model"].global_steps == additional_state["global_step"], "save global_steps is mismatch. chk plz"
+    state.update({"global_step": state["model"].global_steps})
 
     # step
-    step = checkpoint_dict["step"] if "step" in checkpoint_dict.keys() and checkpoint_dict["step"] is not None else 0
+    step = (
+        additional_state["step"] if "step" in additional_state.keys() and additional_state["step"] is not None else 0
+    )
     state.update({"step": step})
 
     # dtype
     dtype = (
-        checkpoint_dict["dtype"]
-        if "dtype" in checkpoint_dict.keys() and checkpoint_dict["dtype"] is not None
+        additional_state["dtype"]
+        if "dtype" in additional_state.keys() and additional_state["dtype"] is not None
         else torch.float32
     )
     state.update({"dtype": dtype})
-
-    # optimizer
-    if (
-        "optimizer" in state.keys()
-        and state["optimizer"] is not None
-        and "optimizer" in checkpoint_dict.keys()
-        and checkpoint_dict["optimizer"] is not None
-    ):
-        state["optimizer"].load_state_dict(checkpoint_dict["optimizer"])
 
     # scheduler_cfg
     if (
         "scheduler_cfg" in state.keys()
         and state["scheduler_cfg"] is not None
-        and "scheduler" in checkpoint_dict.keys()
-        and checkpoint_dict["scheduler"] is not None
+        and "scheduler" in additional_state.keys()
+        and additional_state["scheduler"] is not None
     ):
-        state["scheduler_cfg"]["scheduler"].load_state_dict(checkpoint_dict["scheduler"])
+        state["scheduler_cfg"]["scheduler"].load_state_dict(additional_state["scheduler"])
 
     # trainable_loss
     if (
         "trainable_loss" in state.keys()
         and state["trainable_loss"] is not None
-        and "trainable_loss" in checkpoint_dict.keys()
-        and checkpoint_dict["trainable_loss"] is not None
+        and "trainable_loss" in additional_state.keys()
+        and additional_state["trainable_loss"] is not None
     ):
-        state["trainable_loss"].load_state_dict(checkpoint_dict["trainable_loss"], strict=False)
+        state["trainable_loss"].load_state_dict(additional_state["trainable_loss"], strict=False)
 
-    # model
-    assert "model" in checkpoint_dict, "checkpoint_dict must have model state dict."
-    saved_state_dict = checkpoint_dict["model"]
-    # 불러온 체크포인트와의 shape등을 비교하여, 맞지 않으면 기존에 초기화된걸 쓰기 위한 로직
-    # saved_state_dict은 불러올 모델, state_dict 초기화된 모델을 의미한다.
-    if hasattr(state["model"], "module"):
-        state_dict = state["model"].module.state_dict()
-    else:
-        state_dict = state["model"].state_dict()
+    # # model
+    # assert "model" in checkpoint_dict, "checkpoint_dict must have model state dict."
+    # saved_state_dict = checkpoint_dict["model"]
+    # # 불러온 체크포인트와의 shape등을 비교하여, 맞지 않으면 기존에 초기화된걸 쓰기 위한 로직
+    # # saved_state_dict은 불러올 모델, state_dict 초기화된 모델을 의미한다.
+    # if hasattr(state["model"], "module"):
+    #     state_dict = state["model"].module.state_dict()
+    # else:
+    #     state_dict = state["model"].state_dict()
 
-    # 먼가 다르면 초기화된 weight를 쓰고, 아니면 불러온다.
-    new_state_dict = {}
-    for k in state_dict.keys():
-        if k in saved_state_dict.keys() and state_dict[k].size() == saved_state_dict[k].size():
-            if not load_bias and k.split(".")[-1] == "bias":
-                new_state_dict[k] = state_dict[k]
-            else:
-                new_state_dict[k] = saved_state_dict[k]
+    # # 먼가 다르면 초기화된 weight를 쓰고, 아니면 불러온다.
+    # new_state_dict = {}
+    # for k in state_dict.keys():
+    #     if k in saved_state_dict.keys() and state_dict[k].size() == saved_state_dict[k].size():
+    #         if not load_bias and k.split(".")[-1] == "bias":
+    #             new_state_dict[k] = state_dict[k]
+    #         else:
+    #             new_state_dict[k] = saved_state_dict[k]
 
-    if hasattr(state["model"], "module"):
-        state["model"].module.load_state_dict(new_state_dict)
-    else:
-        state["model"].load_state_dict(new_state_dict)
+    # if hasattr(state["model"], "module"):
+    #     state["model"].module.load_state_dict(new_state_dict)
+    # else:
+    #     state["model"].load_state_dict(new_state_dict)
 
     if logger is not None:
-        logger.info(f"Loaded checkpoint '{checkpoint_filepath}' epoch: {current_epoch} global_step: {global_step}")
+        logger.info(f"Loaded checkpoint '{model_path}' epoch: {current_epoch} global_step: {state['global_step']}")
 
 
 def tensor_dict_to_device(tensor_dict: Dict[str, torch.Tensor], device: str = "cpu", non_blocking: bool = False):

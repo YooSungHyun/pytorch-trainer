@@ -25,7 +25,6 @@ class TrainingArguments:
     weight_decay: float = 0.0001  # weigth decay
     per_device_train_batch_size: int = 1  # The batch size per GPU/TPU core/CPU for training.
     per_device_eval_batch_size: int = 1  # The batch size per GPU/TPU core/CPU for evaluation.
-    deepspeed_config: str = "ds_config/zero2.json"
     dropout_p: float = 0.0  # Drop path rate (default: 0.0)
     cutoff_epoch: int = 0  # if drop_mode is early / late, this is the epoch where dropout ends / starts
     drop_mode: str = sp.field(default="standard", choices=["standard", "early", "late"])  # drop mode

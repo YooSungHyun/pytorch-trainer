@@ -7,7 +7,6 @@ import torch
 from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -67,8 +66,6 @@ class Trainer:
             self.is_fp16 = True
         else:
             self.precision = precision_dict["fp32"]
-
-        self.grad_scaler = GradScaler(enabled=self.is_fp16)
 
         self.logger = cmd_logger
         self.web_logger = web_logger
@@ -140,9 +137,10 @@ class Trainer:
 
         # load last checkpoint if available
         if ckpt_path is not None and os.path.isdir(ckpt_path):
-            latest_checkpoint_path = self.get_latest_checkpoint(self.checkpoint_dir)
+            latest_checkpoint_path = self.get_latest_checkpoint(self.checkpoint_dir, "global_step")
+            # if don't have any global_step dir, can not load model
             if latest_checkpoint_path is not None:
-                state.update(self.load(state, latest_checkpoint_path))
+                state.update(self.load(state, ckpt_path))
                 # check if we even need to train here
                 if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
                     self.should_stop = True
@@ -173,8 +171,7 @@ class Trainer:
             if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
                 self.should_stop = True
 
-            if self.device_id == 0:
-                self.save(state)
+            self.save(state)
 
         # reset for next fit call
         self.should_stop = False
@@ -249,18 +246,14 @@ class Trainer:
                     self.device_id,
                 )
 
-                if self.max_norm > 0.0:
-                    self.grad_scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.max_norm)
+                assert model.lr_scheduler is None, "In my trainer, deepspeed scheduler is not used!!!!"
+                # it is just optimizer.step() and zero_grad
+                model.step()
 
-                self.grad_scaler.step(optimizer)
-                self.grad_scaler.update()
+                # def on_before_zero_grad(optimizer):
+                #     pass
 
-                def on_before_zero_grad(optimizer):
-                    pass
-
-                on_before_zero_grad(optimizer)
-                optimizer.zero_grad()
+                # on_before_zero_grad(optimizer)
             else:
                 # gradient accumulation -> no optimizer step
                 loss = self.training_step(model=model, batch=batch, batch_idx=batch_idx)
@@ -291,6 +284,7 @@ class Trainer:
             self.step += 1
             # only increase global step if optimizer stepped
             self.global_step += int(should_optim_step)
+            assert model.global_steps == self.global_step, "global_step mismatch check accumul or something!"
 
             # stopping criterion on step level
             if self.max_steps is not None and self.global_step >= self.max_steps:
@@ -461,7 +455,7 @@ class Trainer:
             pass
 
         on_before_backward(loss)
-        self.grad_scaler.scale(loss).backward()
+        model.backward(loss)
 
         def on_after_backward():
             pass
@@ -563,8 +557,7 @@ class Trainer:
             path: the path to load the checkpoint from
 
         """
-        if state is None:
-            state = {}
+        assert state is not None, "state error!!! check model initialize!"
 
         load_checkpoint(state, checkpoint_filepath=path, device=self.device, logger=self.logger)
         self.global_step = state.pop("global_step")
@@ -579,8 +572,6 @@ class Trainer:
             self.is_fp16 = False
             if self.precision in [torch.float16, torch.bfloat16]:
                 self.is_fp16 = True
-
-            self.grad_scaler = GradScaler(enabled=self.is_fp16)
 
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")
@@ -603,12 +594,12 @@ class Trainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         save_checkpoint(
             **state,
-            checkpoint_filepath=os.path.join(self.checkpoint_dir, f"epoch-{self.current_epoch:04d}.ckpt"),
+            checkpoint_filepath=self.checkpoint_dir,
             logger=self.logger,
         )
 
     @staticmethod
-    def get_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    def get_latest_checkpoint(checkpoint_dir: str, name_part: str) -> Optional[str]:
         """Returns the latest checkpoint from the ``checkpoint_dir``
 
         Args:
@@ -618,12 +609,17 @@ class Trainer:
         if not os.path.isdir(checkpoint_dir):
             return None
 
-        items = sorted(os.listdir(checkpoint_dir))
+        items = os.listdir(checkpoint_dir)
 
-        if not items:
+        matching_folders = [
+            item for item in items if name_part in item and os.path.isdir(os.path.join(checkpoint_dir, item))
+        ]
+        if not matching_folders:
             return None
 
-        return os.path.join(checkpoint_dir, items[-1])
+        latest_folder = max(matching_folders, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
+
+        return os.path.join(checkpoint_dir, latest_folder)
 
     @staticmethod
     def _format_iterable(

@@ -122,7 +122,7 @@ class Trainer:
 
         # load last checkpoint if available
         if ckpt_path is not None and os.path.isdir(ckpt_path):
-            latest_checkpoint_path = self.get_latest_checkpoint(self.checkpoint_dir)
+            latest_checkpoint_path = self.get_latest_checkpoint(self.checkpoint_dir, ".ckpt")
             if latest_checkpoint_path is not None:
                 state.update(self.load(state, latest_checkpoint_path))
                 # check if we even need to train here
@@ -516,7 +516,7 @@ class Trainer:
         )
 
     @staticmethod
-    def get_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    def get_latest_checkpoint(checkpoint_dir: str, name_part: str) -> Optional[str]:
         """Returns the latest checkpoint from the ``checkpoint_dir``
 
         Args:
@@ -526,12 +526,17 @@ class Trainer:
         if not os.path.isdir(checkpoint_dir):
             return None
 
-        items = sorted(os.listdir(checkpoint_dir))
+        items = os.listdir(checkpoint_dir)
 
-        if not items:
+        matching_folders = [
+            item for item in items if name_part in item and os.path.isfile(os.path.join(checkpoint_dir, item))
+        ]
+        if not matching_folders:
             return None
 
-        return os.path.join(checkpoint_dir, items[-1])
+        latest_folder = max(matching_folders, key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)))
+
+        return os.path.join(checkpoint_dir, latest_folder)
 
     @staticmethod
     def _format_iterable(

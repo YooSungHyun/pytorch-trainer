@@ -67,6 +67,7 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [ ] deepspeed_trainer - training loop additional process?(for distributed learning)
 -   [ ] deepspeed_trainer - wandb have to using gather or something?
 -   [ ] deepspeed_trainer - Reliable wandb logging for distributed learning
+-   [ ] fsdp_trainer
 -   [ ] inference - ipynb, py3
 -   [ ] huggingface - float16 model is real model dtype is float16? check and applied
 
@@ -74,7 +75,8 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 
 **tensorboard** - I personally find it too inconvenient.
 
-**fsdp** - deepspeed is more comfortable for me... ( **I'll consider this if I get more requests**).
+# Gradient Checkpointing is implemented in nn.Module network!! so, I can not make any process...
+useful link: https://github.com/prigoyal/pytorch_memonger/blob/master/tutorial/Checkpointing_for_PyTorch_models.ipynb
 
 # plz help!!!
 
