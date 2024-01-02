@@ -27,4 +27,4 @@ deepspeed --include localhost:0,1,2,3 --master_port 61000 ./ds_train.py \
     --dataloader_drop_last=False \
     --sampler_shuffle=True \
     --log_every_n=100 \
-    --deepspeed_config=ds_config/zero1.json
+    --deepspeed_config=ds_config/zero3.json

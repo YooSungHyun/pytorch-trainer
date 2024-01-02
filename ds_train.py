@@ -57,7 +57,6 @@ def main(hparams: TrainingArguments):
     web_logger = None
     if device_id == 0:
         web_logger = wandb.init(config=hparams)
-        web_logger.log_code(hparams.deepspeed_config)
     seed_everything(hparams.seed)
     os.makedirs(hparams.output_dir, exist_ok=True)
 

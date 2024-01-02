@@ -10,8 +10,6 @@ class Net(nn.Module):
         self.fc = nn.Linear(16, 1, bias=True)
 
     def forward(self, inputs):
-        self.lstm1.flatten_parameters()
-        self.lstm2.flatten_parameters()
         hidden, _ = self.lstm1(inputs)
         hidden, _ = self.lstm2(hidden)
         hidden = hidden[:, -1, :]
