@@ -72,6 +72,29 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [ ] inference - ipynb, py3
 -   [ ] huggingface - float16 model is real model dtype is float16? check and applied
 
+# Deepspeed ZeRO Test result (lstm1: n_layer, lstem2: n_layer each 1000)
+The `ZeRO` test is not accurate because the model was run with an lstm.
+
+Since the LSTM requires contiguous parameters to be fully guaranteed, the partitioning may not have worked well.
+
+![lstm warning](./readme_lstm.png)
+
+Also, I have some doubts about the CPU offload performance because I used TORCH OPTIMIZED ADAMW, not DEEPSPEED OPTIMIZED ADAMW.
+
+
+However, I will share the results of what I did with 2 lstm layers set to 1000 n_layer.
+
+RTX3090 GPU Mem (Mib)
+zero2 not offload: 2016
+zero2 optim offload: 1964
+---------------------------
+zero3 full offload: 2044
+zero3 optim offload: 2010
+zeor3 param offload: 2044
+zero3 not offload: 2054
+
+I think, optim offload is good but, param offload is strange...
+
 # Unsupported list
 
 **tensorboard** - I personally find it too inconvenient.
@@ -81,7 +104,7 @@ useful link: https://github.com/prigoyal/pytorch_memonger/blob/master/tutorial/C
 
 # plz help!!!
 
-I don't have much understanding of accelerate, so I'm looking for someone to help me out, PRs are always welcome.
+I don't have much understanding of distirbuted learning, so I'm looking for someone to help me out, PRs are always welcome.
 
 Bugfixes and improvements are always welcome.
 

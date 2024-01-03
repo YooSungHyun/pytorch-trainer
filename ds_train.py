@@ -35,27 +35,23 @@ logger.addHandler(timeFileHandler)
 
 
 def main(hparams: TrainingArguments):
-    world_size = os.environ.get("WORLD_SIZE", None)
-    if world_size:
-        world_size = int(world_size)
-    else:
-        world_size = torch.cuda.device_count()
+    world_size = int(os.environ.get("WORLD_SIZE", -1))
+    rank = int(os.environ.get("RANK", -1))
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
 
-    rank = os.environ.get("LOCAL_RANK", None)
-    if rank:
-        rank = int(rank)
-    else:
-        rank = dist.get_rank()
-    # logger.info(f"Start running basic DDP example on rank {rank}.")
+    logger.info(
+        f"Start running basic deepspeed example on total {world_size} computers, {rank}'s process on {local_rank}'s gpu."
+    )
 
-    device_id = rank % world_size
-    torch.cuda.set_device(device_id)
-    deepspeed.init_distributed("nccl")
+    assert world_size > -1 and rank > -1 and local_rank > -1, "Your distributed environ is wrong, plz check and retry!"
+
+    torch.cuda.set_device(local_rank)
+    deepspeed.init_distributed("nccl", rank=rank, world_size=world_size)
 
     # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
     setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
     web_logger = None
-    if device_id == 0:
+    if local_rank == 0:
         web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
     os.makedirs(hparams.output_dir, exist_ok=True)
@@ -153,23 +149,23 @@ def main(hparams: TrainingArguments):
         custom_train_sampler = DistributedLengthGroupedSampler(
             batch_size=hparams.per_device_train_batch_size,
             dataset=train_dataset,
-            rank=device_id,
+            rank=rank,
             seed=hparams.seed,
             model_input_name=train_dataset.length_column_name,
         )
         custom_eval_sampler = DistributedLengthGroupedSampler(
             batch_size=hparams.per_device_eval_batch_size,
             dataset=eval_dataset,
-            rank=device_id,
+            rank=rank,
             seed=hparams.seed,
             model_input_name=eval_dataset.length_column_name,
         )
     else:
         # DistributedSampler's shuffle: each device get random indices data segment in every epoch
         custom_train_sampler = DistributedSampler(
-            train_dataset, seed=hparams.seed, rank=device_id, shuffle=hparams.sampler_shuffle
+            train_dataset, seed=hparams.seed, rank=rank, shuffle=hparams.sampler_shuffle
         )
-        custom_eval_sampler = DistributedSampler(eval_dataset, seed=hparams.seed, rank=device_id, shuffle=False)
+        custom_eval_sampler = DistributedSampler(eval_dataset, seed=hparams.seed, rank=rank, shuffle=False)
 
     # DataLoader's shuffle: one device get random indices dataset in every epoch
     # example np_dataset is already set (feature)7:1(label), so, it can be all shuffle `True` between sampler and dataloader
@@ -202,9 +198,9 @@ def main(hparams: TrainingArguments):
     steps_per_epoch = math.floor(len(train_dataloader) / hparams.accumulate_grad_batches)
 
     # Instantiate objects
-    model = Net().cuda(device_id)
+    model = Net().cuda(local_rank)
 
-    if device_id == 0:
+    if local_rank == 0:
         web_logger.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = None
@@ -321,7 +317,7 @@ def main(hparams: TrainingArguments):
     logger.debug(log_str)
 
     trainer = Trainer(
-        device_id=device_id,
+        device_id=local_rank,
         precision=hparams.model_dtype,
         cmd_logger=logger,
         web_logger=web_logger,
@@ -344,7 +340,7 @@ def main(hparams: TrainingArguments):
         trainable_loss=trainable_loss,
     )
 
-    if device_id == 0:
+    if local_rank == 0:
         web_logger.finish(exit_code=0)
 
 
