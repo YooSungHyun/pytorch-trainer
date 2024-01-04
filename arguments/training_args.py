@@ -6,7 +6,7 @@ import simple_parsing as sp
 class TrainingArguments:
     """Help string for this group of command-line arguments"""
 
-    train_datasets_path: str
+    train_datasets_path: str = None
     eval_datasets_path: str = None
     transformers_model_name: str = None
     train_data_ratio: float = 0.7

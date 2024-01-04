@@ -2,10 +2,10 @@
     "mixed_precision": false,
     "use_fp16": false,
     "seed": 42,
-    "fsdp_activation_checkpointing": false,
+    "fsdp_activation_checkpointing": true,
     "limit_all_gathers": true,
     "sharding_strategy": "FULL_SHARD",
-    "checkpoint_type": "SHARDED_STATE_DICT",
+    "checkpoint_type": "FULL_STATE_DICT",
     "save_optimizer": true,
     "offload_params": true
 }

@@ -66,12 +66,6 @@ SHARDING_STRATEGY = {
     "_HYBRID_SHARD_ZERO2": ShardingStrategy._HYBRID_SHARD_ZERO2,
 }
 
-CHECKPOINT_TYPE = {
-    "FULL_STATE_DICT": StateDictType.FULL_STATE_DICT,
-    "LOCAL_STATE_DICT": StateDictType.LOCAL_STATE_DICT,
-    "SHARDED_STATE_DICT": StateDictType.SHARDED_STATE_DICT,
-}
-
 
 def main(hparams: TrainingArguments):
     setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
@@ -143,14 +137,14 @@ def main(hparams: TrainingArguments):
             dataset=train_dataset,
             rank=rank,
             seed=hparams.seed,
-            model_input_name="source_id",
+            model_input_name="source_ids",
         )
         custom_eval_sampler = DistributedLengthGroupedSampler(
             batch_size=hparams.per_device_eval_batch_size,
             dataset=eval_dataset,
             rank=rank,
             seed=hparams.seed,
-            model_input_name="source_id",
+            model_input_name="source_ids",
         )
     else:
         # DistributedSampler's shuffle: each device get random indices data segment in every epoch
@@ -288,7 +282,6 @@ def main(hparams: TrainingArguments):
 
     trainer = Trainer(
         device_id=local_rank,
-        precision=hparams.model_dtype,
         cmd_logger=logger,
         web_logger=web_logger,
         max_epochs=hparams.max_epochs,
@@ -297,7 +290,6 @@ def main(hparams: TrainingArguments):
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,
         max_norm=hparams.max_norm,
-        checkpoint_type=CHECKPOINT_TYPE[fsdp_config["checkpoint_type"]],
     )
 
     trainer.fit(
@@ -311,6 +303,9 @@ def main(hparams: TrainingArguments):
         trainable_loss=trainable_loss,
     )
 
+    from utils.model_checkpointing.fsdp_handler import save_model_checkpoint
+
+    save_model_checkpoint(fsdp_model, rank, os.path.join(hparams.output_dir, "final"), logger)
     if local_rank == 0:
         web_logger.finish(exit_code=0)
     dist.destroy_process_group()

@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime
 import torch
 import time
-
+from typing_extensions import TypeGuard
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     StateDictType,
@@ -27,65 +27,14 @@ from torch.distributed.checkpoint.default_planner import (
 # from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 import torch.distributed._shard.checkpoint as dist_cp
 import torch.distributed as dist
-
+from typing import Generator
 
 # create singleton saving policies to avoid making over and over
 fullstate_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
 
-def load_model_sharded(model, rank, checkpoint_folder, logger=None):
-    # torch.manual_seed(103)
-
-    reader = FileSystemReader(Path(checkpoint_folder))
-
-    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-        checkpoint = model.state_dict()
-        if rank == 0:
-            ck = checkpoint.keys()
-            logger.info(f" checkpoint key len = {len(ck)} and \n keys =  {ck}")
-
-        dist_cp.load_state_dict(
-            state_dict=checkpoint,
-            storage_reader=reader,
-        )
-        if rank == 0:
-            logger.info("checkpoint after load_state_dict()")
-            ck = checkpoint.keys()
-            logger.info(f" checkpoint key len = {len(ck)} and \n keys =  {ck}")
-        model.load_state_dict(checkpoint)
-    if rank == 0:
-        logger.info(f"Sharded state checkpoint loaded from {checkpoint_folder}")
-
-
-def save_model_and_optimizer_sharded(model, rank, checkpoint_folder, optim=None, logger=None):
-    """save model and optimizer via sharded_state_dict to save_dir"""
-
-    if rank == 0:
-        print(f"Saving model to {checkpoint_folder}")
-
-    distributed_writer = dist_cp.FileSystemWriter(checkpoint_folder)
-
-    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-        state_dict = {"model": model.state_dict()}
-        if optim is not None:
-            state_dict["optim"] = FSDP.optim_state_dict(model, optim)
-
-        dist_cp.save_state_dict(
-            state_dict=state_dict,
-            storage_writer=distributed_writer,
-            planner=DefaultSavePlanner(),
-        )
-    dist.barrier()
-    if rank == 0:
-        logger.info(f"Sharded state checkpoint saved to {checkpoint_folder}")
-
-
-def save_model_checkpoint(model, optimizer, rank, checkpoint_folder, checkpoint_type, epoch=1, logger=None):
+def save_model_checkpoint(model, rank, checkpoint_folder, logger=None):
     """saving model via rank0 cpu streaming and full_state_dict"""
-
-    # saving with rank0 cpu
-    if not checkpoint_type == StateDictType.FULL_STATE_DICT:
-        logger.info(f" unable to handle checkpoint type {checkpoint_type}, aborting")
 
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fullstate_save_policy):
         cpu_state = model.state_dict()
@@ -95,12 +44,12 @@ def save_model_checkpoint(model, optimizer, rank, checkpoint_folder, checkpoint_
     if rank == 0:
         logger.info("--> saving model ...")
         # create save path
-        save_full_path = os.path.join(checkpoint_folder, f"epoch-{epoch:04d}.ckpt")
+        save_full_path = os.path.join(checkpoint_folder, "final_model.pt")
 
         # save model
         torch.save(cpu_state, save_full_path)
 
-        logger.info(f"model checkpoint saved for epoch {epoch} at {save_full_path}\n")
+        logger.info(f"train end & model checkpoint saved at {save_full_path}\n")
 
 
 def load_model_checkpoint(model, rank, checkpoint_filepath, logger=None):
@@ -124,93 +73,122 @@ def load_model_checkpoint(model, rank, checkpoint_filepath, logger=None):
     logger.info("model checkpoint loaded to rank0 cpu")
 
 
-def save_optimizer_checkpoint(model, optimizer, rank, checkpoint_folder, epoch=1, logger=None):
-    """save optimizer state via full state dict"""
+def load_distributed_model_checkpoint(model, rank, checkpoint_folder, logger=None):
+    logger.info(f"loading distributed checkpoint, rank {rank}...")
 
-    logger.info("--> optim state call on rank {rank}\n")
+    checkdir = Path(checkpoint_folder)
 
-    # pull all sharded optimizer states to rank0 cpu...
-
-    optim_state = FSDP.full_optim_state_dict(model, optimizer)
-
-    logger.info("optim state dict ready on {rank} and len of {len(optim_state)}\n")
-
-    if rank == 0:
-        opt_save_full_path = os.path.join(checkpoint_folder, "optimizer.pt")
-        logger.info("--> saving optimizer state...")
-
-        torch.save(optim_state, opt_save_full_path)
-        logger.info(f"--> saved {opt_save_full_path} to disk")
-
-
-def load_optimizer_checkpoint(model, optimizer, rank, optimizer_ckpt_filepath, logger=None):
-    """load an fdsp optimizer full_state checkpoint using scatter method
-    this ensures only rank 0 loads the optimizer state dict and scatters to other ranks
-    """
-
-    opt_file_path = Path(optimizer_ckpt_filepath)
-
-    if not opt_file_path.is_file():
-        logger.info(f"warning - optimizer checkpoint not present {opt_file_path}. Returning. ")
+    if not checkdir.exists():
+        if rank == 0:
+            logger.info("No checkpoint directory found...skipping")
         return
 
-    full_osd = None
+    reader = FileSystemReader(checkdir)
 
-    if rank == 0:
-        full_osd = torch.load(opt_file_path)
-        logger.info("loaded full osd on rank 0")
+    with FSDP.state_dict_type(model, StateDictType.LOCAL_STATE_DICT):
+        state_dict = model.state_dict()
+        load_state_dict(state_dict, reader)
+        model.load_state_dict(state_dict)
 
-    # called from all ranks, though only rank0 has a valid param for full_osd
-    sharded_osd = FSDP.scatter_full_optim_state_dict(full_osd, model)
+    logger.info(f"--> local state loaded on rank {rank}")
 
-    logger.info(f"optimizer shard loaded on rank {rank}")
-
-
-def load_distributed_model_checkpoint(model, rank, checkpoint_type, checkpoint_folder, logger=None):
-    if checkpoint_type == StateDictType.LOCAL_STATE_DICT:
-        logger.info(f"loading distributed checkpoint, rank {rank}...")
-
-        checkdir = Path(checkpoint_folder)
-
-        if not checkdir.exists():
-            if rank == 0:
-                logger.info("No checkpoint directory found...skipping")
-            return
-
-        reader = FileSystemReader(checkdir)
-
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.LOCAL_STATE_DICT,
-        ):
-            state_dict = model.state_dict()
-            load_state_dict(state_dict, reader)
-            model.load_state_dict(state_dict)
-
-        logger.info(f"--> local state loaded on rank {rank}")
-
-        return
+    return
 
 
-def save_distributed_model_checkpoint(model, rank, checkpoint_type, checkpoint_folder, epoch=1):
+def save_distributed_model_checkpoint(model, checkpoint_folder):
     # distributed checkpoint saving
 
-    # confirm type of checkpoint and save
-    if checkpoint_type == StateDictType.LOCAL_STATE_DICT:
-        # create writer to current path
-        save_dir = Path(checkpoint_folder)
+    # create writer to current path
+    save_dir = Path(checkpoint_folder)
 
-        writer = FileSystemWriter(
-            save_dir,
-        )
+    writer = FileSystemWriter(save_dir)
 
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.LOCAL_STATE_DICT,
-        ):
-            state_dict = model.state_dict()
+    with FSDP.state_dict_type(model, StateDictType.LOCAL_STATE_DICT):
+        state_dict = model.state_dict()
 
-        # write out distributed checkpoint
-        save_state_dict(state_dict, writer)
+    # write out distributed checkpoint
+    save_state_dict(state_dict, writer)
 
-        return
+    return
+
+
+def load_client_state(state: dict, checkpoint_filepath: str, device: str = "cpu", logger=None):
+    """Load model checkpoint.
+
+    Args:
+        checkpoint_filepath: checkpoint filename including path.
+        model: torch model.
+        optimizer: torch optimizer.
+
+    Returns:
+        state: dict
+    """
+    assert os.path.isfile(checkpoint_filepath)
+    checkpoint_dict = torch.load(checkpoint_filepath, map_location=device)
+
+    # epoch
+    current_epoch = (
+        checkpoint_dict["current_epoch"]
+        if ("current_epoch" in checkpoint_dict.keys() and checkpoint_dict["current_epoch"] is not None)
+        else 0
+    )
+    state.update({"current_epoch": current_epoch})
+
+    # global_step
+    global_step = (
+        checkpoint_dict["global_step"]
+        if "global_step" in checkpoint_dict.keys() and checkpoint_dict["global_step"] is not None
+        else 0
+    )
+    state.update({"global_step": global_step})
+
+    # step
+    step = checkpoint_dict["step"] if "step" in checkpoint_dict.keys() and checkpoint_dict["step"] is not None else 0
+    state.update({"step": step})
+
+    # dtype
+    dtype = (
+        checkpoint_dict["dtype"]
+        if "dtype" in checkpoint_dict.keys() and checkpoint_dict["dtype"] is not None
+        else torch.float32
+    )
+    state.update({"dtype": dtype})
+
+    # optimizer
+    if (
+        "optimizer" in state.keys()
+        and state["optimizer"] is not None
+        and "optimizer" in checkpoint_dict.keys()
+        and checkpoint_dict["optimizer"] is not None
+    ):
+        state["optimizer"].load_state_dict(checkpoint_dict["optimizer"])
+
+    # scheduler_cfg
+    if (
+        "scheduler_cfg" in state.keys()
+        and state["scheduler_cfg"] is not None
+        and "scheduler" in checkpoint_dict.keys()
+        and checkpoint_dict["scheduler"] is not None
+    ):
+        state["scheduler_cfg"]["scheduler"].load_state_dict(checkpoint_dict["scheduler"])
+
+    # trainable_loss
+    if (
+        "grad_scaler" in state.keys()
+        and state["grad_scaler"] is not None
+        and "grad_scaler" in checkpoint_dict.keys()
+        and checkpoint_dict["grad_scaler"] is not None
+    ):
+        state.update({"grad_scaler": checkpoint_dict["grad_scaler"]})
+
+    # trainable_loss
+    if (
+        "trainable_loss" in state.keys()
+        and state["trainable_loss"] is not None
+        and "trainable_loss" in checkpoint_dict.keys()
+        and checkpoint_dict["trainable_loss"] is not None
+    ):
+        state["trainable_loss"].load_state_dict(checkpoint_dict["trainable_loss"], strict=False)
+
+    if logger is not None:
+        logger.info(f"Loaded client_state '{checkpoint_filepath}' epoch: {current_epoch} global_step: {global_step}")
