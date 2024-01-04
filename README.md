@@ -67,7 +67,7 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [x] deepspeed_trainer - training loop additional process?(for distributed learning)
 -   [x] deepspeed_trainer - wandb have to using gather or something?
 -   [x] deepspeed_trainer - Reliable wandb logging for distributed learning
--   [ ] fsdp_trainer - change deepspeed to fsdp
+-   [x] fsdp_trainer - change deepspeed to fsdp
 -   [ ] fsdp_trainer - test
 -   [ ] eval epoch end all_gather on cpu, eval on cpu (?)
 -   [ ] Implement customizable training and eval step inheritance
