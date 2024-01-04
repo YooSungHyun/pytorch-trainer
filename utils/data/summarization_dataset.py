@@ -21,8 +21,8 @@ from transformers import AdamW, T5ForConditionalGeneration, T5Tokenizer, get_lin
 
 
 class wikihow(Dataset):
-    def __init__(self, tokenizer, type_path, num_samples, input_length, output_length, print_text=False):
-        self.dataset = load_dataset("wikihow", "all", data_dir="data/", split=type_path)
+    def __init__(self, tokenizer, type_path, data_dir, num_samples, input_length, output_length, print_text=False):
+        self.dataset = load_dataset("wikihow", "all", data_dir=data_dir, split=type_path)
         if num_samples:
             self.dataset = self.dataset.select(list(range(0, num_samples)))
         self.input_length = input_length
@@ -80,11 +80,11 @@ class wikihow(Dataset):
         }
 
 
-def get_dataset(tokenizer, type_path, num_samples, args):
+def get_dataset(tokenizer, type_path, num_samples, max_input_length, max_output_length):
     return wikihow(
         tokenizer=tokenizer,
         type_path=type_path,
         num_samples=num_samples,
-        input_length=args.max_input_length,
-        output_length=args.max_output_length,
+        input_length=max_input_length,
+        output_length=max_output_length,
     )

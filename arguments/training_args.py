@@ -43,3 +43,4 @@ class TrainingArguments:
     sampler_shuffle: bool = True
     max_norm: float = 0.0  # gradient clipping max_norm value
     model_dtype: str = "fp32"
+    fsdp_config: str = "./fsdp_config/config.json"

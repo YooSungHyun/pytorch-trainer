@@ -4,9 +4,10 @@ from functools import partial
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
 import time
 import torch
-from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device, web_log_every_n
+from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
 import torch.distributed as dist
+from utils.model_checkpointing.ds_handler import load_checkpoint, save_checkpoint
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -129,7 +130,6 @@ class Trainer:
         # assemble state (current epoch and global step will be added in save)
         state = {
             "model": model,
-            "optimizer": optimizer,
             "scheduler_cfg": scheduler_cfg,
             "trainable_loss": trainable_loss,
             "dtype": self.precision,
@@ -395,7 +395,6 @@ class Trainer:
             local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=self.device)
             size_list = [torch.tensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
             dist.all_gather(size_list, local_size)
-            dist.barrier()
 
             # Create a fixed length tensor with the length of `all_gather`.
             result_gathered_data = [
@@ -410,7 +409,6 @@ class Trainer:
             # Collect and match data from all GPUs.
             dist.all_gather(result_gathered_data, tot_batch_result)
             dist.all_gather(labels_gathered_data, tot_batch_labels)
-            dist.barrier()
 
             # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
             result_gathered_data = torch.cat(result_gathered_data, dim=0)

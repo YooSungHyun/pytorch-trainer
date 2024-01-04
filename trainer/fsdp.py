@@ -4,10 +4,13 @@ from functools import partial
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
 import time
 import torch
-from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device, web_log_every_n
+from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
+from torch.nn import CrossEntropyLoss
+from utils.model_checkpointing.fsdp_handler import save_model_and_optimizer_sharded, load_model_sharded
+from utils.model_checkpointing.common_handler import save_checkpoint
+from torch.distributed.fsdp import StateDictType
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -32,6 +35,7 @@ class Trainer:
         non_blocking: bool = True,
         log_every_n: int = 1,
         max_norm: float = 0.0,
+        checkpoint_type: StateDictType = StateDictType.SHARDED_STATE_DICT,
     ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
@@ -68,8 +72,6 @@ class Trainer:
         else:
             self.precision = precision_dict["fp32"]
 
-        self.grad_scaler = GradScaler(enabled=self.is_fp16)
-
         self.logger = cmd_logger
         self.web_logger = web_logger
         self.chk_addr_dict = chk_addr_dict
@@ -101,6 +103,7 @@ class Trainer:
 
         self.checkpoint_dir = checkpoint_dir
         self.checkpoint_frequency = checkpoint_frequency
+        self.checkpoint_type = checkpoint_type
 
         self.non_blocking = non_blocking
         self.log_every_n = log_every_n
@@ -139,13 +142,13 @@ class Trainer:
         }
 
         # load last checkpoint if available
-        if ckpt_path is not None and os.path.isdir(ckpt_path):
-            latest_checkpoint_path = self.get_latest_checkpoint(self.checkpoint_dir, ".ckpt")
-            if latest_checkpoint_path is not None:
-                state.update(self.load(state, latest_checkpoint_path))
-                # check if we even need to train here
-                if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
-                    self.should_stop = True
+        # if ckpt_path is not None and os.path.isdir(ckpt_path):
+        #     latest_checkpoint_path = self.get_latest_checkpoint(self.checkpoint_dir, "epoch")
+        #     if latest_checkpoint_path is not None:
+        #         state.update(self.load(state, latest_checkpoint_path))
+        #         # check if we even need to train here
+        #         if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
+        #             self.should_stop = True
 
         self.criterion = criterion
         while not self.should_stop:
@@ -173,8 +176,7 @@ class Trainer:
             if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
                 self.should_stop = True
 
-            if self.device_id == 0:
-                self.save(state)
+            self.save(state)
 
         # reset for next fit call
         self.should_stop = False
@@ -249,12 +251,7 @@ class Trainer:
                     self.device_id,
                 )
 
-                if self.max_norm > 0.0:
-                    self.grad_scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.max_norm)
-
-                self.grad_scaler.step(optimizer)
-                self.grad_scaler.update()
+                optimizer.step()
 
                 def on_before_zero_grad(optimizer):
                     pass
@@ -341,6 +338,8 @@ class Trainer:
         eval_step = 0
         tot_batch_result = list()
         tot_batch_labels = list()
+        eval_end_fn_on = "cpu"
+        # eval_end_fn_on = self.device_id
         for batch_idx, batch in pbar:
             # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,
             # but it was not much different from outputting the value of GPU 0.
@@ -357,15 +356,14 @@ class Trainer:
 
             on_validation_batch_start(batch, batch_idx)
 
-            # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-            with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
-                labels = batch.pop("labels")
+            # TODO(User): fit the input and output for your model architecture!
+            output = model(
+                input_ids=batch["source_ids"], attention_mask=batch["source_mask"], labels=batch["target_ids"]
+            )
+            loss = output["loss"]
 
-                outputs = model(**batch)
-                loss = self.criterion(outputs, labels)
-
-            tot_batch_result.append(outputs)
-            tot_batch_labels.append(labels)
+            tot_batch_result.append(output["logits"].to(eval_end_fn_on))
+            tot_batch_labels.append(batch["target_ids"].to(eval_end_fn_on))
 
             outputs = {"loss": loss}
             # avoid gradients in stored/accumulated values -> prevents potential OOM
@@ -392,47 +390,55 @@ class Trainer:
                 self._format_iterable(iterable, self._current_val_return, "val")
             eval_step += 1
 
-        def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
+        def on_validation_epoch_end(tot_batch_result, tot_batch_labels, eval_end_fn_on):
+            eval_metric = CrossEntropyLoss(ignore_index=-100)
+
             tot_batch_result = torch.cat(tot_batch_result, dim=0)
             tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
 
             # all_gather` requires a `fixed length tensor` as input.
             # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
-            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=self.device)
-            size_list = [torch.tensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
-            dist.all_gather(size_list, local_size)
-            dist.barrier()
+            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=eval_end_fn_on)
+            size_list = [
+                torch.tensor([0], dtype=torch.long, device=eval_end_fn_on) for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather_object(size_list, local_size)
 
             # Create a fixed length tensor with the length of `all_gather`.
             result_gathered_data = [
-                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype, device=self.device)
+                torch.zeros(
+                    (size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype, device=eval_end_fn_on
+                )
                 for size in size_list
             ]
             labels_gathered_data = [
-                torch.zeros((size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype, device=self.device)
+                torch.zeros(
+                    (size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype, device=eval_end_fn_on
+                )
                 for size in size_list
             ]
 
             # Collect and match data from all GPUs.
-            dist.all_gather(result_gathered_data, tot_batch_result)
-            dist.all_gather(labels_gathered_data, tot_batch_labels)
-            dist.barrier()
+            dist.all_gather_object(result_gathered_data, tot_batch_result)
+            dist.all_gather_object(labels_gathered_data, tot_batch_labels)
 
             # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
             result_gathered_data = torch.cat(result_gathered_data, dim=0)
             labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
-            epoch_loss = self.criterion(result_gathered_data, labels_gathered_data)
-            epoch_rmse = torch.sqrt(epoch_loss)
+
+            total_loss = eval_metric(
+                result_gathered_data.view(-1, result_gathered_data.size(-1)), labels_gathered_data.view(-1)
+            )
             # epoch monitoring is must doing every epoch
             web_log_every_n(
                 self.web_logger,
-                {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch},
+                {"eval/loss": total_loss, "eval/epoch": self.current_epoch},
                 self.current_epoch,
                 1,
                 self.device_id,
             )
 
-        on_validation_epoch_end(tot_batch_result, tot_batch_labels)
+        on_validation_epoch_end(tot_batch_result, tot_batch_labels, eval_end_fn_on)
 
         def on_validation_model_train(model):
             torch.set_grad_enabled(True)
@@ -450,18 +456,16 @@ class Trainer:
             batch_idx: index of the current batch w.r.t the current epoch
 
         """
-        # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-        with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
-            labels = batch.pop("labels")
-
-            outputs = model(**batch)
-            loss = self.criterion(outputs, labels)
+        # TODO(User): fit the input and output for your model architecture!
+        output = model(input_ids=batch["source_ids"], attention_mask=batch["source_mask"], labels=batch["target_ids"])
+        loss = output["loss"]
 
         def on_before_backward(loss):
             pass
 
         on_before_backward(loss)
-        self.grad_scaler.scale(loss).backward()
+
+        loss.backward()
 
         def on_after_backward():
             pass
@@ -566,7 +570,10 @@ class Trainer:
         if state is None:
             state = {}
 
-        load_checkpoint(state, checkpoint_filepath=path, device=self.device, logger=self.logger)
+        rank = int(os.environ.get("RANK", -1))
+        assert rank > -1, "RANK can not find, plz check before save!"
+
+        load_model_sharded(state["model"], rank, path, self.logger)
         self.global_step = state.pop("global_step")
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
@@ -579,8 +586,6 @@ class Trainer:
             self.is_fp16 = False
             if self.precision in [torch.float16, torch.bfloat16]:
                 self.is_fp16 = True
-
-            self.grad_scaler = GradScaler(enabled=self.is_fp16)
 
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")
@@ -597,14 +602,44 @@ class Trainer:
         if state is None:
             state = {}
 
-        state.update(
-            global_step=self.global_step, current_epoch=self.current_epoch, step=self.step, dtype=self.precision
-        )
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        save_checkpoint(
-            **state,
-            checkpoint_filepath=os.path.join(self.checkpoint_dir, f"epoch-{self.current_epoch:04d}.ckpt"),
-            logger=self.logger,
+        checkpoint_epoch_folder = os.path.join(self.checkpoint_dir, f"epoch-{self.current_epoch:04d}")
+        os.makedirs(checkpoint_epoch_folder, exist_ok=True)
+        rank = int(os.environ.get("RANK", -1))
+        assert rank > -1, "RANK can not find, plz check before save!"
+
+        save_model_and_optimizer_sharded(state["model"], rank, checkpoint_epoch_folder, optim=None, logger=self.logger)
+
+        optimizer_state_dict = None
+        if state["optimizer"] is not None:
+            if hasattr(state["optimizer"], "module"):
+                optimizer_state_dict = state["optimizer"].module.state_dict()
+            else:
+                optimizer_state_dict = state["optimizer"].state_dict()
+
+        scheduler_state_dict = None
+        if hasattr(state["scheduler_cfg"]["scheduler"], "module"):
+            scheduler_state_dict = state["scheduler_cfg"]["scheduler"].module.state_dict()
+        else:
+            scheduler_state_dict = state["scheduler_cfg"]["scheduler"].state_dict()
+
+        loss_state_dict = None
+        if state["trainable_loss"] is not None:
+            if hasattr(state["trainable_loss"], "module"):
+                loss_state_dict = state["trainable_loss"].module.state_dict()
+            else:
+                loss_state_dict = state["trainable_loss"].state_dict()
+        torch.save(
+            {
+                "optimizer": optimizer_state_dict,
+                "current_epoch": self.current_epoch,
+                "global_step": self.global_step,
+                "step": self.step,
+                "scheduler": scheduler_state_dict,
+                "trainable_loss": loss_state_dict,
+                "dtype": self.precision,
+            },
+            os.path.join(checkpoint_epoch_folder, "client_state.pt"),
         )
 
     @staticmethod
@@ -621,7 +656,7 @@ class Trainer:
         items = os.listdir(checkpoint_dir)
 
         matching_folders = [
-            item for item in items if name_part in item and os.path.isfile(os.path.join(checkpoint_dir, item))
+            item for item in items if name_part in item and os.path.isdir(os.path.join(checkpoint_dir, item))
         ]
         if not matching_folders:
             return None

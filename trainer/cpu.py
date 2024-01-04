@@ -1,11 +1,13 @@
 import os
+import time
 from collections.abc import Mapping
 from functools import partial
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
-import time
+
 import torch
-from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
+from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
+from utils.model_checkpointing.common_handler import load_checkpoint, save_checkpoint
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 

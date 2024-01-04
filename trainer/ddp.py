@@ -4,10 +4,11 @@ from functools import partial
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
 import time
 import torch
-from utils.comfy import apply_to_collection, save_checkpoint, load_checkpoint, tensor_dict_to_device, web_log_every_n
+from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler, autocast
+from utils.model_checkpointing.common_handler import load_checkpoint, save_checkpoint
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -136,6 +137,7 @@ class Trainer:
             "scheduler_cfg": scheduler_cfg,
             "trainable_loss": trainable_loss,
             "dtype": self.precision,
+            "grad_scaler": self.grad_scaler,
         }
 
         # load last checkpoint if available
@@ -358,7 +360,7 @@ class Trainer:
             on_validation_batch_start(batch, batch_idx)
 
             # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-            with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
+            with autocast(enabled=self.is_fp16, dtype=self.precision):
                 labels = batch.pop("labels")
 
                 outputs = model(**batch)
@@ -401,7 +403,6 @@ class Trainer:
             local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=self.device)
             size_list = [torch.tensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
             dist.all_gather(size_list, local_size)
-            dist.barrier()
 
             # Create a fixed length tensor with the length of `all_gather`.
             result_gathered_data = [
@@ -416,7 +417,6 @@ class Trainer:
             # Collect and match data from all GPUs.
             dist.all_gather(result_gathered_data, tot_batch_result)
             dist.all_gather(labels_gathered_data, tot_batch_labels)
-            dist.barrier()
 
             # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
             result_gathered_data = torch.cat(result_gathered_data, dim=0)
@@ -451,7 +451,7 @@ class Trainer:
 
         """
         # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-        with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
+        with autocast(enabled=self.is_fp16, dtype=self.precision):
             labels = batch.pop("labels")
 
             outputs = model(**batch)
@@ -570,6 +570,7 @@ class Trainer:
         self.global_step = state.pop("global_step")
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
+        self.grad_scaler = state.pop(["grad_scaler"])
 
         if self.precision != state["dtype"]:
             self.logger.warning(
@@ -579,8 +580,6 @@ class Trainer:
             self.is_fp16 = False
             if self.precision in [torch.float16, torch.bfloat16]:
                 self.is_fp16 = True
-
-            self.grad_scaler = GradScaler(enabled=self.is_fp16)
 
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")
@@ -598,7 +597,11 @@ class Trainer:
             state = {}
 
         state.update(
-            global_step=self.global_step, current_epoch=self.current_epoch, step=self.step, dtype=self.precision
+            global_step=self.global_step,
+            current_epoch=self.current_epoch,
+            step=self.step,
+            dtype=self.precision,
+            grad_scaler=self.grad_scaler,
         )
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         save_checkpoint(
