@@ -26,9 +26,8 @@ from utils.data.summarization_dataset import wikihow
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
 
-from utils.fsdp import mixed_precision
-from utils.fsdp.wrapping import get_transformers_wrapper
-from utils.fsdp.activation_checkpointing_functions import apply_fsdp_checkpointing
+from utils.FSDP import mixed_precision
+from utils.FSDP.wrapping import get_transformers_wrapper
 import inspect
 
 
