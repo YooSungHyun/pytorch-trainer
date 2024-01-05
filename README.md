@@ -35,19 +35,24 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
 1.   Download raw data and input dir `raw_data`
 2.   Copy Model Network(just `nn.Module`) in `networks` dir
 3.   make `preprocess.py` and preprocess yourself
-4.   if you have to make dataset, check `np_dataset.py` or `pd_dataset.py` and change
-5.   if you have to make sampler, check `custom_sampler.py`
+4.   if you have to make or copy `dataset`, input `utils/data/` and check some sample
+5.   if you have to make or `sampler, loader`, input `utils/data` and check some sample
      -   i make some useful sampler in `custom_sampler.py` already (reference HF's transformers)
      -   DistributedBucketSampler : make random batch, but lengths same as possible.
      -   LengthGroupedSampler : descending order by `length` column, and select random indices batch. (dynamic batching)
      -   DistributedLengthGroupedSampler: distributed dynamic batching
 6.   change `[cpu|ddp|deepspeed]_train.py`
-     -   make to dataset, dataloader, etc
+     1.   Defines the `Trainer` inheritance, which is already implemented.
+          Since the training pipeline may vary from model to model and dataset to dataset, we've used `@abstractmethod` to give <u>you direct control</u>, and if you need to implement additional inheritance, we've made it easy to do so by ripping out the parts you need and referencing them.
+     2.   Basically, you can modify the `training_step` and `eval_loop`, which require a loss operation, and do whatever you want to accomplish, utilizing `batches`, `labels`, `criterion`, and `eval_metric`.
+          I was implemented examples for using `all_gather` and more in each of the `ddp`,`deepspeed`,`fsdp` examples, so check them out and write your own code effectively!
+     3.   I've implemented `chk_addr_dict`, which makes heavy use of the `dictionary inplace function`, to reference address values during `debug`. Always be careful that your own implementations don't run out of memory with each other!
+7.   In the `main` function, you'll do some simple operations on the `data` at the beginning and prepare the ingredients for your `model`, `optimizer`, and `scheduler`. 
      -   **learning rate scheduler must be `{"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}`**
      -   `frequency` is step accumulation, if is 2, for every 2 train steps, take 1 scheduler step.
      -   `monitor` is for only `ReduceLROnPlateau`'s loss value
-7.   I'm used dict inplace very much. so, use `chk_addr_dict` for compare dict addr. if it is difference, it causes unexpected results. 
-8. `cd {your-workpsace}/pytorch-trainer` & `sh scripts/run_train_[cpu|ddp|deepseed].sh`
+8.   run! `cd {your-workpsace}/pytorch-trainer` & `sh scripts/run_train_[cpu|ddp|deepseed].sh`
+
 # TODO LIST
 
 each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspace=user-bart_tadev)
@@ -70,11 +75,12 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [x] fsdp_trainer - change deepspeed to fsdp
 -   [x] fsdp_trainer - test (wandb compare this [link](https://medium.com/nlplanet/bert-finetuning-with-hugging-face-and-training-visualizations-with-tensorboard-46368a57fc97))
 -   [x] eval epoch end all_gather on cpu, eval on cpu (?)
--   [ ] Implement customizable training and eval step inheritance
+-   [x] Implement customizable training and eval step inheritance
 -   [ ] inference - ipynb, py3
 -   [ ] huggingface - float16 model is real model dtype is float16? check and applied
 
 # Deepspeed ZeRO Test result (lstm1: n_layer, lstem2: n_layer each 1000)
+
 The `ZeRO` test is not accurate because the model was run with an lstm.
 
 Since the LSTM requires contiguous parameters to be fully guaranteed, the partitioning(cpu-gpu) may not have worked well.
@@ -102,6 +108,7 @@ I think, optim offload is good but, param offload is strange...
 **tensorboard** - I personally find it too inconvenient.
 
 # Gradient Checkpointing is implemented in nn.Module network!! so, I can not make any process...
+
 useful link: https://github.com/prigoyal/pytorch_memonger/blob/master/tutorial/Checkpointing_for_PyTorch_models.ipynb
 
 # plz help!!!
@@ -113,4 +120,5 @@ Bugfixes and improvements are always welcome.
 **If you can recommend any accelerator related blogs or videos for me to study, I would be grateful. (in issue or someting)**
 
 # Special Thanks!
+
 [@jp1924](https://github.com/jp1924) [@ddobokki](https://github.com/ddobokki) [@Master_yang](https://github.com/effortprogrammer)

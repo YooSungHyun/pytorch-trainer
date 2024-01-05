@@ -54,7 +54,6 @@ class DDPTrainer(Trainer):
         limit_train_batches: Union[int, float] = float("inf"),
         limit_val_batches: Union[int, float] = float("inf"),
         validation_frequency: int = 1,
-        use_distributed_sampler: bool = True,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
@@ -79,8 +78,6 @@ class DDPTrainer(Trainer):
             limit_val_batches: Limits the number of validation batches per epoch.
                 If greater than number of batches in the dataloader, this has no effect.
             validation_frequency: How many epochs to run before each validation epoch.
-            use_distributed_sampler: Wraps the sampler of each dataloader with a respective distributed-aware sampler
-                in case of distributed training.
             checkpoint_dir: Directory to store checkpoints to.
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
@@ -97,7 +94,6 @@ class DDPTrainer(Trainer):
             limit_train_batches,
             limit_val_batches,
             validation_frequency,
-            use_distributed_sampler,
             checkpoint_dir,
             checkpoint_frequency,
             chk_addr_dict,
@@ -333,7 +329,6 @@ def main(hparams: TrainingArguments):
     if local_rank == 0:
         web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
-    os.makedirs(hparams.output_dir, exist_ok=True)
 
     df_train = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
     # Kaggle author Test Final RMSE: 0.06539
@@ -407,22 +402,6 @@ def main(hparams: TrainingArguments):
         feature_column_name=hparams.feature_column_name,
         labels_column_name=hparams.labels_column_name,
     )
-    # if hparams.eval_datasets_path:
-    #     eval_df = pd.read_csv(hparams.eval_datasets_path)
-    #     train_dataset = PandasDataset(train_df, length_column_name=hparams.length_column_name)
-    # else:
-    #     # it is just for lstm example
-    #     train_df = train_df[::-1]
-    #     train_size = int(len(train_df) * hparams.train_data_ratio)
-    #     splited_train_df = train_df[0:train_size]
-    #     eval_df = train_df[train_size - seq_length :]
-    #     train_dataset = PandasDataset(splited_train_df, length_column_name=hparams.length_column_name)
-    #     # if you use another one, plz check here
-    #     # train_size = int(hparams.train_data_ratio * len(train_df))
-    #     # eval_size = len(train_df) - train_size
-    #     # train_dataset = PandasDataset(hparams.train_datasets_path)
-    #     # train_dataset, eval_dataset = random_split(train_dataset, [train_size, eval_size])
-    # eval_dataset = PandasDataset(eval_df, length_column_name=hparams.length_column_name)
 
     # Instantiate objects
     model = Net().cuda(local_rank)
@@ -543,6 +522,7 @@ def main(hparams: TrainingArguments):
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,
         max_norm=hparams.max_norm,
+        metric_on_cpu=hparams.metric_on_cpu,
     )
 
     trainer.fit(

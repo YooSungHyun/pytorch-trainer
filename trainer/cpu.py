@@ -1,8 +1,7 @@
 import os
-import time
+from abc import ABCMeta, abstractmethod
 from collections.abc import Mapping
-from functools import partial
-from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
+from typing import Any, Iterable, Literal, Optional, Union, cast
 
 import torch
 from tqdm import tqdm
@@ -12,9 +11,10 @@ from utils.model_checkpointing.common_handler import load_checkpoint, save_check
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
-class Trainer:
+class Trainer(metaclass=ABCMeta):
     def __init__(
         self,
+        eval_metric=None,
         precision="fp32",
         cmd_logger=None,
         web_logger=None,
@@ -24,7 +24,6 @@ class Trainer:
         limit_train_batches: Union[int, float] = float("inf"),
         limit_val_batches: Union[int, float] = float("inf"),
         validation_frequency: int = 1,
-        use_distributed_sampler: bool = True,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
@@ -47,13 +46,12 @@ class Trainer:
             limit_val_batches: Limits the number of validation batches per epoch.
                 If greater than number of batches in the dataloader, this has no effect.
             validation_frequency: How many epochs to run before each validation epoch.
-            use_distributed_sampler: Wraps the sampler of each dataloader with a respective distributed-aware sampler
-                in case of distributed training.
             checkpoint_dir: Directory to store checkpoints to.
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
         """
         assert precision in ["fp32", "float32"], "cpu mode only support float32 training"
+        self.eval_metric = eval_metric
         self.precision = precision_dict["fp32"]
 
         self.logger = cmd_logger
@@ -81,7 +79,6 @@ class Trainer:
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.validation_frequency = validation_frequency
-        self.use_distributed_sampler = use_distributed_sampler
         self._current_train_return: Union[torch.Tensor, Mapping[str, Any]] = {}
         self._current_val_return: Optional[Union[torch.Tensor, Mapping[str, Any]]] = {}
 
@@ -265,145 +262,18 @@ class Trainer:
 
         on_train_epoch_end()
 
+    @abstractmethod
     def eval_loop(
         self,
         model,
         val_loader: Optional[torch.utils.data.DataLoader],
         limit_batches: Union[int, float] = float("inf"),
     ):
-        """The validation loop ruunning a single validation epoch.
+        pass
 
-        Args:
-            model: model
-            val_loader: The dataloader yielding the validation batches.
-            limit_batches: Limits the batches during this validation epoch.
-                If greater than the number of batches in the ``val_loader``, this has no effect.
-
-        """
-        # no validation if val_loader wasn't passed
-        if val_loader is None:
-            return
-
-        def on_validation_model_eval(model):
-            model.eval()
-            # requires_grad = True, but loss.backward() raised error
-            # because grad_fn is None
-            torch.set_grad_enabled(False)
-
-        on_validation_model_eval(model)
-
-        def on_validation_epoch_start():
-            pass
-
-        iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
-        eval_step = 0
-        tot_batch_result = list()
-        tot_batch_labels = list()
-        for batch_idx, batch in enumerate(iterable):
-            tensor_dict_to_device(batch, "cpu", non_blocking=self.non_blocking)
-            # end epoch if stopping training completely or max batches for this epoch reached
-            if self.should_stop or batch_idx >= limit_batches:
-                break
-
-            def on_validation_batch_start(batch, batch_idx):
-                pass
-
-            on_validation_batch_start(batch, batch_idx)
-
-            # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-            labels = batch.pop("labels")
-
-            outputs = model(**batch)
-
-            loss = self.criterion(outputs, labels)
-
-            tot_batch_result.append(outputs)
-            tot_batch_labels.append(labels)
-
-            outputs = {"loss": loss}
-            # avoid gradients in stored/accumulated values -> prevents potential OOM
-            self._current_val_return = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
-
-            def on_validation_batch_end(eval_out, batch, batch_idx):
-                pass
-
-            on_validation_batch_end(outputs, batch, batch_idx)
-
-            web_log_every_n(
-                self.web_logger,
-                {
-                    "eval_step/loss": self._current_val_return["loss"],
-                    "eval_step/step": eval_step,
-                    "eval_step/global_step": self.global_step,
-                    "eval_step/epoch": self.current_epoch,
-                },
-                eval_step,
-                self.log_every_n,
-            )
-            self._format_iterable(iterable, self._current_val_return, "val")
-            eval_step += 1
-
-        def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
-            tot_batch_result = torch.cat(tot_batch_result, dim=0)
-            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
-            epoch_loss = self.criterion(tot_batch_result, tot_batch_labels)
-            epoch_rmse = torch.sqrt(epoch_loss)
-            # epoch monitoring is must doing every epoch
-            web_log_every_n(
-                self.web_logger, {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch}, self.current_epoch, 1
-            )
-
-        on_validation_epoch_end(tot_batch_result, tot_batch_labels)
-
-        def on_validation_model_train(model):
-            torch.set_grad_enabled(True)
-            model.train()
-
-        on_validation_model_train(model)
-
+    @abstractmethod
     def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:
-        """A single training step, running forward and backward. The optimizer step is called separately, as this is
-        given as a closure to the optimizer step.
-
-        Args:
-            model: model to train
-            batch: the batch to run the forward on
-            batch_idx: index of the current batch w.r.t the current epoch
-
-        """
-        # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-        labels = batch.pop("labels")
-
-        outputs = model(**batch)
-        loss = self.criterion(outputs, labels)
-
-        def on_before_backward(loss):
-            pass
-
-        on_before_backward(loss)
-        loss.backward()
-
-        def on_after_backward():
-            pass
-
-        on_after_backward()
-
-        outputs = {"loss": loss}
-        # avoid gradients in stored/accumulated values -> prevents potential OOM
-        self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
-
-        web_log_every_n(
-            self.web_logger,
-            {
-                "train/loss": self._current_train_return["loss"],
-                "train/step": self.step,
-                "train/global_step": self.global_step,
-                "train/epoch": self.current_epoch,
-            },
-            self.step,
-            self.log_every_n,
-        )
-        return loss
+        pass
 
     def step_scheduler(
         self,

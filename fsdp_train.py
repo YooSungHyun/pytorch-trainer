@@ -73,7 +73,6 @@ class FSDPTrainer(Trainer):
         limit_train_batches: Union[int, float] = float("inf"),
         limit_val_batches: Union[int, float] = float("inf"),
         validation_frequency: int = 1,
-        use_distributed_sampler: bool = True,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
@@ -94,7 +93,6 @@ class FSDPTrainer(Trainer):
             limit_train_batches,
             limit_val_batches,
             validation_frequency,
-            use_distributed_sampler,
             checkpoint_dir,
             checkpoint_frequency,
             chk_addr_dict,
@@ -355,8 +353,6 @@ def main(hparams: TrainingArguments):
     web_logger = None
     if local_rank == 0:
         web_logger = wandb.init(config=hparams)
-
-    os.makedirs(hparams.output_dir, exist_ok=True)
 
     model = AutoModelForSequenceClassification.from_pretrained(hparams.transformers_model_name, num_labels=2)
     tokenizer = AutoTokenizer.from_pretrained(hparams.transformers_model_name)

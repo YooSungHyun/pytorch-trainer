@@ -30,7 +30,6 @@ from utils.comfy import (
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
 from utils.data.np_dataset import NumpyDataset
-from utils.data.pd_dataset import PandasDataset
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -172,7 +171,7 @@ class DSTrainer(Trainer):
         tot_batch_labels = list()
 
         if self.metric_on_cpu:
-            metric_on_device = "cpu"
+            metric_on_device = torch.device("cpu")
         else:
             metric_on_device = model.device
 
@@ -312,7 +311,6 @@ def main(hparams: TrainingArguments):
     web_logger = None
     if local_rank == 0:
         web_logger = wandb.init(config=hparams)
-    os.makedirs(hparams.output_dir, exist_ok=True)
 
     df_train = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
     # Kaggle author Test Final RMSE: 0.06539
@@ -561,7 +559,7 @@ def main(hparams: TrainingArguments):
     eval_metric = None
     trainer = DSTrainer(
         device_id=local_rank,
-        evel_metric=eval_metric,
+        eval_metric=eval_metric,
         precision=hparams.model_dtype,
         cmd_logger=logger,
         web_logger=web_logger,

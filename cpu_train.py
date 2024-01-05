@@ -2,23 +2,31 @@ import logging
 import math
 import os
 from logging import StreamHandler
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
 import torch
 import wandb
 from arguments.training_args import TrainingArguments
-from trainer.cpu import Trainer
 from networks.models import Net
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import RandomSampler, SequentialSampler, random_split
-from utils.comfy import dataclass_to_namespace, seed_everything
+from trainer.cpu import Trainer
+from utils.comfy import (
+    apply_to_collection,
+    dataclass_to_namespace,
+    json_to_dict,
+    seed_everything,
+    tensor_dict_to_device,
+    update_auto_nested_dict,
+    web_log_every_n,
+)
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import LengthGroupedSampler
 from utils.data.np_dataset import NumpyDataset
-from utils.data.pd_dataset import PandasDataset
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -28,6 +36,187 @@ timeFileHandler = StreamHandler()
 timeFileHandler.setFormatter(formatter)
 
 logger.addHandler(timeFileHandler)
+
+
+# TODO(User): override training_step and eval_loop for your style
+class CPUTrainer(Trainer):
+    def __init__(
+        self,
+        eval_metric=None,
+        precision="fp32",
+        cmd_logger=None,
+        web_logger=None,
+        max_epochs: Optional[int] = 1000,
+        max_steps: Optional[int] = None,
+        grad_accum_steps: int = 1,
+        limit_train_batches: Union[int, float] = float("inf"),
+        limit_val_batches: Union[int, float] = float("inf"),
+        validation_frequency: int = 1,
+        checkpoint_dir: str = "./checkpoints",
+        checkpoint_frequency: int = 1,
+        chk_addr_dict: dict = None,
+        non_blocking: bool = True,
+        log_every_n: int = 1,
+    ):
+        super().__init__(
+            eval_metric,
+            precision,
+            cmd_logger,
+            web_logger,
+            max_epochs,
+            max_steps,
+            grad_accum_steps,
+            limit_train_batches,
+            limit_val_batches,
+            validation_frequency,
+            checkpoint_dir,
+            checkpoint_frequency,
+            chk_addr_dict,
+            non_blocking,
+            log_every_n,
+        )
+
+    def training_step(self, model, batch, batch_idx) -> torch.Tensor:
+        """A single training step, running forward and backward. The optimizer step is called separately, as this is
+        given as a closure to the optimizer step.
+
+        Args:
+            model: model to train
+            batch: the batch to run the forward on
+            batch_idx: index of the current batch w.r.t the current epoch
+
+        """
+        # TODO(User): fit the input and output for your model architecture!
+        labels = batch.pop("labels")
+
+        outputs = model(**batch)
+        loss = self.criterion(outputs, labels)
+
+        def on_before_backward(loss):
+            pass
+
+        on_before_backward(loss)
+        loss.backward()
+
+        def on_after_backward():
+            pass
+
+        on_after_backward()
+
+        outputs = {"loss": loss}
+        # avoid gradients in stored/accumulated values -> prevents potential OOM
+        self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
+
+        web_log_every_n(
+            self.web_logger,
+            {
+                "train/loss": self._current_train_return["loss"],
+                "train/step": self.step,
+                "train/global_step": self.global_step,
+                "train/epoch": self.current_epoch,
+            },
+            self.step,
+            self.log_every_n,
+        )
+        return loss
+
+    def eval_loop(
+        self,
+        model,
+        val_loader: Optional[torch.utils.data.DataLoader],
+        limit_batches: Union[int, float] = float("inf"),
+    ):
+        """The validation loop ruunning a single validation epoch.
+
+        Args:
+            model: model
+            val_loader: The dataloader yielding the validation batches.
+            limit_batches: Limits the batches during this validation epoch.
+                If greater than the number of batches in the ``val_loader``, this has no effect.
+
+        """
+        # no validation if val_loader wasn't passed
+        if val_loader is None:
+            return
+
+        def on_validation_model_eval(model):
+            model.eval()
+            # requires_grad = True, but loss.backward() raised error
+            # because grad_fn is None
+            torch.set_grad_enabled(False)
+
+        on_validation_model_eval(model)
+
+        def on_validation_epoch_start():
+            pass
+
+        iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
+        eval_step = 0
+        tot_batch_logits = list()
+        tot_batch_labels = list()
+        for batch_idx, batch in enumerate(iterable):
+            tensor_dict_to_device(batch, "cpu", non_blocking=self.non_blocking)
+            # end epoch if stopping training completely or max batches for this epoch reached
+            if self.should_stop or batch_idx >= limit_batches:
+                break
+
+            def on_validation_batch_start(batch, batch_idx):
+                pass
+
+            on_validation_batch_start(batch, batch_idx)
+
+            # TODO(User): fit the input and output for your model architecture!
+            label = batch.pop("labels")
+
+            output = model(**batch)
+
+            loss = self.criterion(output, label)
+
+            # TODO(User): what do you want to log items every epoch end?
+            tot_batch_logits.append(output)
+            tot_batch_labels.append(label)
+
+            log_output = {"loss": loss}
+            # avoid gradients in stored/accumulated values -> prevents potential OOM
+            self._current_val_return = apply_to_collection(log_output, torch.Tensor, lambda x: x.detach())
+
+            def on_validation_batch_end(eval_out, batch, batch_idx):
+                pass
+
+            on_validation_batch_end(output, batch, batch_idx)
+
+            web_log_every_n(
+                self.web_logger,
+                {
+                    "eval_step/loss": self._current_val_return["loss"],
+                    "eval_step/step": eval_step,
+                    "eval_step/global_step": self.global_step,
+                    "eval_step/epoch": self.current_epoch,
+                },
+                eval_step,
+                self.log_every_n,
+            )
+            self._format_iterable(iterable, self._current_val_return, "val")
+            eval_step += 1
+
+        # TODO(User): Create any form you want to output to wandb!
+        def on_validation_epoch_end(tot_batch_logits, tot_batch_labels):
+            tot_batch_logits = torch.cat(tot_batch_logits, dim=0)
+            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
+            epoch_loss = self.criterion(tot_batch_logits, tot_batch_labels)
+            epoch_rmse = torch.sqrt(epoch_loss)
+            # epoch monitoring is must doing every epoch
+            web_log_every_n(
+                self.web_logger, {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch}, self.current_epoch, 1
+            )
+
+        on_validation_epoch_end(tot_batch_logits, tot_batch_labels)
+
+        def on_validation_model_train(model):
+            torch.set_grad_enabled(True)
+            model.train()
+
+        on_validation_model_train(model)
 
 
 def main(hparams: TrainingArguments):
@@ -109,22 +298,6 @@ def main(hparams: TrainingArguments):
         feature_column_name=hparams.feature_column_name,
         labels_column_name=hparams.labels_column_name,
     )
-    # if hparams.eval_datasets_path:
-    #     eval_df = pd.read_csv(hparams.eval_datasets_path)
-    #     train_dataset = PandasDataset(train_df, length_column_name=hparams.length_column_name)
-    # else:
-    #     # it is just for lstm example
-    #     train_df = train_df[::-1]
-    #     train_size = int(len(train_df) * hparams.train_data_ratio)
-    #     splited_train_df = train_df[0:train_size]
-    #     eval_df = train_df[train_size - seq_length :]
-    #     train_dataset = PandasDataset(splited_train_df, length_column_name=hparams.length_column_name)
-    #     # if you use another one, plz check here
-    #     # train_size = int(hparams.train_data_ratio * len(train_df))
-    #     # eval_size = len(train_df) - train_size
-    #     # train_dataset = PandasDataset(hparams.train_datasets_path)
-    #     # train_dataset, eval_dataset = random_split(train_dataset, [train_size, eval_size])
-    # eval_dataset = PandasDataset(eval_df, length_column_name=hparams.length_column_name)
 
     # Instantiate objects
     model = Net()
@@ -222,8 +395,10 @@ def main(hparams: TrainingArguments):
     ##########################################
     """
     logger.debug(log_str)
-
-    trainer = Trainer(
+    # TODO(User): input your eval_metric
+    eval_metric = None
+    trainer = CPUTrainer(
+        eval_metric=eval_metric,
         precision=hparams.model_dtype,
         cmd_logger=logger,
         web_logger=web_logger,

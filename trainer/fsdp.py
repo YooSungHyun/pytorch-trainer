@@ -440,7 +440,6 @@ class Trainer(metaclass=ABCMeta):
         assert rank > -1, "RANK can not find, plz check before save!"
         checkpoint_epoch_folder = os.path.join(self.checkpoint_dir, f"epoch-{self.current_epoch:04d}")
         if rank == 0:
-            os.makedirs(self.checkpoint_dir, exist_ok=True)
             os.makedirs(checkpoint_epoch_folder, exist_ok=True)
         dist.barrier()
 

@@ -1,13 +1,11 @@
 import os
 from abc import ABCMeta, abstractmethod
 from collections.abc import Mapping
-from functools import partial
-from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
+from typing import Any, Iterable, Literal, Optional, Union, cast
 import time
 import torch
 from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
 from tqdm import tqdm
-import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from utils.model_checkpointing.common_handler import load_checkpoint, save_checkpoint
 
@@ -28,7 +26,6 @@ class Trainer(metaclass=ABCMeta):
         limit_train_batches: Union[int, float] = float("inf"),
         limit_val_batches: Union[int, float] = float("inf"),
         validation_frequency: int = 1,
-        use_distributed_sampler: bool = True,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
@@ -53,8 +50,6 @@ class Trainer(metaclass=ABCMeta):
             limit_val_batches: Limits the number of validation batches per epoch.
                 If greater than number of batches in the dataloader, this has no effect.
             validation_frequency: How many epochs to run before each validation epoch.
-            use_distributed_sampler: Wraps the sampler of each dataloader with a respective distributed-aware sampler
-                in case of distributed training.
             checkpoint_dir: Directory to store checkpoints to.
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
@@ -101,7 +96,6 @@ class Trainer(metaclass=ABCMeta):
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.validation_frequency = validation_frequency
-        self.use_distributed_sampler = use_distributed_sampler
         self._current_train_return: Union[torch.Tensor, Mapping[str, Any]] = {}
         self._current_val_return: Optional[Union[torch.Tensor, Mapping[str, Any]]] = {}
 
