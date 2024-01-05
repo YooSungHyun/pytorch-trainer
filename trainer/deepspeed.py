@@ -1,18 +1,18 @@
 import os
+from abc import ABCMeta, abstractmethod
 from collections.abc import Mapping
-from functools import partial
-from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
-import time
+from typing import Any, Iterable, Literal, Optional, Union, cast
+
 import torch
-from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
-from tqdm import tqdm
 import torch.distributed as dist
+from tqdm import tqdm
+from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
 from utils.model_checkpointing.ds_handler import load_checkpoint, save_checkpoint
 
 precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
-class Trainer:
+class Trainer(metaclass=ABCMeta):
     def __init__(
         self,
         device_id,
@@ -25,13 +25,13 @@ class Trainer:
         limit_train_batches: Union[int, float] = float("inf"),
         limit_val_batches: Union[int, float] = float("inf"),
         validation_frequency: int = 1,
-        use_distributed_sampler: bool = True,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
         non_blocking: bool = True,
         log_every_n: int = 1,
         max_norm: float = 0.0,
+        metric_on_cpu: bool = False,
     ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
@@ -49,8 +49,6 @@ class Trainer:
             limit_val_batches: Limits the number of validation batches per epoch.
                 If greater than number of batches in the dataloader, this has no effect.
             validation_frequency: How many epochs to run before each validation epoch.
-            use_distributed_sampler: Wraps the sampler of each dataloader with a respective distributed-aware sampler
-                in case of distributed training.
             checkpoint_dir: Directory to store checkpoints to.
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
@@ -58,13 +56,11 @@ class Trainer:
         self.device_id = device_id  # it is same rank
         self.device = torch.device("cuda:{}".format(device_id))
 
-        self.is_fp16 = False
+        # in deepspeed, precision is just using model log for .pt file
         if precision in ["fp16", "float16"]:
             self.precision = precision_dict["fp16"]
-            self.is_fp16 = True
         elif precision in ["bf16" or "bfloat16"]:
             self.precision = precision_dict["bf16"]
-            self.is_fp16 = True
         else:
             self.precision = precision_dict["fp32"]
 
@@ -93,7 +89,6 @@ class Trainer:
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.validation_frequency = validation_frequency
-        self.use_distributed_sampler = use_distributed_sampler
         self._current_train_return: Union[torch.Tensor, Mapping[str, Any]] = {}
         self._current_val_return: Optional[Union[torch.Tensor, Mapping[str, Any]]] = {}
 
@@ -104,6 +99,7 @@ class Trainer:
         self.log_every_n = log_every_n
 
         self.max_norm = max_norm
+        self.metric_on_cpu = metric_on_cpu
 
     def fit(
         self,
@@ -130,6 +126,7 @@ class Trainer:
         # assemble state (current epoch and global step will be added in save)
         state = {
             "model": model,
+            "optimizer": optimizer,
             "scheduler_cfg": scheduler_cfg,
             "trainable_loss": trainable_loss,
             "dtype": self.precision,
@@ -296,11 +293,9 @@ class Trainer:
 
         on_train_epoch_end()
 
+    @abstractmethod
     def eval_loop(
-        self,
-        model,
-        val_loader: Optional[torch.utils.data.DataLoader],
-        limit_batches: Union[int, float] = float("inf"),
+        self, model, val_loader: Optional[torch.utils.data.DataLoader], limit_batches: Union[int, float] = float("inf")
     ):
         """The validation loop ruunning a single validation epoch.
 
@@ -311,127 +306,9 @@ class Trainer:
                 If greater than the number of batches in the ``val_loader``, this has no effect.
 
         """
-        # no validation if val_loader wasn't passed
-        if val_loader is None:
-            return
+        pass
 
-        def on_validation_model_eval(model):
-            model.eval()
-            # requires_grad = True, but loss.backward() raised error
-            # because grad_fn is None
-            torch.set_grad_enabled(False)
-
-        on_validation_model_eval(model)
-
-        def on_validation_epoch_start():
-            pass
-
-        if self.device_id == 0:
-            iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
-            pbar = enumerate(iterable)
-        else:
-            pbar = enumerate(val_loader)
-
-        eval_step = 0
-        tot_batch_result = list()
-        tot_batch_labels = list()
-        for batch_idx, batch in pbar:
-            # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,
-            # but it was not much different from outputting the value of GPU 0.
-            # Therefore, all sections except EVAL EPOCH END only output the value of rank 0.
-            tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
-            # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
-
-            # end epoch if stopping training completely or max batches for this epoch reached
-            if self.should_stop or batch_idx >= limit_batches:
-                break
-
-            def on_validation_batch_start(batch, batch_idx):
-                pass
-
-            on_validation_batch_start(batch, batch_idx)
-
-            # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-            with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
-                labels = batch.pop("labels")
-
-                outputs = model(**batch)
-                loss = self.criterion(outputs, labels)
-
-            tot_batch_result.append(outputs)
-            tot_batch_labels.append(labels)
-
-            outputs = {"loss": loss}
-            # avoid gradients in stored/accumulated values -> prevents potential OOM
-            self._current_val_return = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
-
-            def on_validation_batch_end(eval_out, batch, batch_idx):
-                pass
-
-            on_validation_batch_end(outputs, batch, batch_idx)
-
-            web_log_every_n(
-                self.web_logger,
-                {
-                    "eval_step/loss": self._current_val_return["loss"],
-                    "eval_step/step": eval_step,
-                    "eval_step/global_step": self.global_step,
-                    "eval_step/epoch": self.current_epoch,
-                },
-                eval_step,
-                self.log_every_n,
-                self.device_id,
-            )
-            if self.device_id == 0:
-                self._format_iterable(iterable, self._current_val_return, "val")
-            eval_step += 1
-
-        def on_validation_epoch_end(tot_batch_result, tot_batch_labels):
-            tot_batch_result = torch.cat(tot_batch_result, dim=0)
-            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
-
-            # all_gather` requires a `fixed length tensor` as input.
-            # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
-            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=self.device)
-            size_list = [torch.tensor([0], dtype=torch.long, device=self.device) for _ in range(dist.get_world_size())]
-            dist.all_gather(size_list, local_size)
-
-            # Create a fixed length tensor with the length of `all_gather`.
-            result_gathered_data = [
-                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype, device=self.device)
-                for size in size_list
-            ]
-            labels_gathered_data = [
-                torch.zeros((size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype, device=self.device)
-                for size in size_list
-            ]
-
-            # Collect and match data from all GPUs.
-            dist.all_gather(result_gathered_data, tot_batch_result)
-            dist.all_gather(labels_gathered_data, tot_batch_labels)
-
-            # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
-            result_gathered_data = torch.cat(result_gathered_data, dim=0)
-            labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
-            epoch_loss = self.criterion(result_gathered_data, labels_gathered_data)
-            epoch_rmse = torch.sqrt(epoch_loss)
-            # epoch monitoring is must doing every epoch
-            web_log_every_n(
-                self.web_logger,
-                {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch},
-                self.current_epoch,
-                1,
-                self.device_id,
-            )
-
-        on_validation_epoch_end(tot_batch_result, tot_batch_labels)
-
-        def on_validation_model_train(model):
-            torch.set_grad_enabled(True)
-            model.train()
-
-        on_validation_model_train(model)
-
+    @abstractmethod
     def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:
         """A single training step, running forward and backward. The optimizer step is called separately, as this is
         given as a closure to the optimizer step.
@@ -442,41 +319,7 @@ class Trainer:
             batch_idx: index of the current batch w.r.t the current epoch
 
         """
-        # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-        with torch.autocast(device_type="cuda", dtype=self.precision, enabled=self.is_fp16):
-            labels = batch.pop("labels")
-
-            outputs = model(**batch)
-            loss = self.criterion(outputs, labels)
-
-        def on_before_backward(loss):
-            pass
-
-        on_before_backward(loss)
-        model.backward(loss)
-
-        def on_after_backward():
-            pass
-
-        on_after_backward()
-
-        outputs = {"loss": loss}
-        # avoid gradients in stored/accumulated values -> prevents potential OOM
-        self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
-
-        web_log_every_n(
-            self.web_logger,
-            {
-                "train/loss": self._current_train_return["loss"],
-                "train/step": self.step,
-                "train/global_step": self.global_step,
-                "train/epoch": self.current_epoch,
-            },
-            self.step,
-            self.log_every_n,
-            self.device_id,
-        )
-        return loss
+        pass
 
     def step_scheduler(
         self,
@@ -557,7 +400,7 @@ class Trainer:
         """
         assert state is not None, "state error!!! check model initialize!"
 
-        load_checkpoint(state, checkpoint_filepath=path, device=self.device, logger=self.logger)
+        load_checkpoint(state, checkpoint_filepath=path, logger=self.logger)
         self.global_step = state.pop("global_step")
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
@@ -567,9 +410,6 @@ class Trainer:
                 f"Trainer precision {self.precision} not matched load state {state['dtype']} plz check!!!!!!"
             )
             self.precision = state["dtype"]
-            self.is_fp16 = False
-            if self.precision in [torch.float16, torch.bfloat16]:
-                self.is_fp16 = True
 
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")

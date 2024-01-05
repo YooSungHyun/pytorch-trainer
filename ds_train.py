@@ -2,6 +2,7 @@ import logging
 import math
 import os
 from logging import StreamHandler
+from typing import Optional, Union
 
 import deepspeed
 import numpy as np
@@ -15,14 +16,21 @@ from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DistributedSampler, random_split
+from torch_optimizer import Adafactor
 from trainer.deepspeed import Trainer
-from utils.comfy import dataclass_to_namespace, seed_everything, json_to_dict, update_auto_nested_dict
+from utils.comfy import (
+    dataclass_to_namespace,
+    json_to_dict,
+    seed_everything,
+    update_auto_nested_dict,
+    apply_to_collection,
+    web_log_every_n,
+    tensor_dict_to_device,
+)
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
 from utils.data.np_dataset import NumpyDataset
 from utils.data.pd_dataset import PandasDataset
-from torch_optimizer import Adafactor
-
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -34,7 +42,255 @@ timeFileHandler.setFormatter(formatter)
 logger.addHandler(timeFileHandler)
 
 
+# TODO(User): override training_step and eval_loop for your style
+class DSTrainer(Trainer):
+    def __init__(
+        self,
+        device_id,
+        precision="fp32",
+        cmd_logger=None,
+        web_logger=None,
+        max_epochs: Optional[int] = 1000,
+        max_steps: Optional[int] = None,
+        grad_accum_steps: int = 1,
+        limit_train_batches: Union[int, float] = float("inf"),
+        limit_val_batches: Union[int, float] = float("inf"),
+        validation_frequency: int = 1,
+        checkpoint_dir: str = "./checkpoints",
+        checkpoint_frequency: int = 1,
+        chk_addr_dict: dict = None,
+        non_blocking: bool = True,
+        log_every_n: int = 1,
+        max_norm: float = 0.0,
+        metric_on_cpu: bool = False,
+    ):
+        super().__init__(
+            device_id,
+            precision,
+            cmd_logger,
+            web_logger,
+            max_epochs,
+            max_steps,
+            grad_accum_steps,
+            limit_train_batches,
+            limit_val_batches,
+            validation_frequency,
+            checkpoint_dir,
+            checkpoint_frequency,
+            chk_addr_dict,
+            non_blocking,
+            log_every_n,
+            max_norm,
+            metric_on_cpu,
+        )
+
+    def training_step(self, model, batch, batch_idx) -> torch.Tensor:
+        """A single training step, running forward and backward. The optimizer step is called separately, as this is
+        given as a closure to the optimizer step.
+
+        Args:
+            model: model to train
+            batch: the batch to run the forward on
+            batch_idx: index of the current batch w.r.t the current epoch
+
+        """
+        # TODO(User): fit the input and output for your model architecture!
+        labels = batch.pop("labels")
+
+        output = model(**batch)
+        loss = self.criterion(output, labels)
+
+        def on_before_backward(loss):
+            pass
+
+        on_before_backward(loss)
+        model.backward(loss)
+
+        def on_after_backward():
+            pass
+
+        on_after_backward()
+
+        log_output = {"loss": loss}
+        # avoid gradients in stored/accumulated values -> prevents potential OOM
+        self._current_train_return = apply_to_collection(log_output, dtype=torch.Tensor, function=lambda x: x.detach())
+
+        web_log_every_n(
+            self.web_logger,
+            {
+                "train/loss": self._current_train_return["loss"],
+                "train/step": self.step,
+                "train/global_step": self.global_step,
+                "train/epoch": self.current_epoch,
+            },
+            self.step,
+            self.log_every_n,
+            self.device_id,
+        )
+        return loss
+
+    def eval_loop(
+        self,
+        model,
+        val_loader: Optional[torch.utils.data.DataLoader],
+        limit_batches: Union[int, float] = float("inf"),
+    ):
+        """The validation loop ruunning a single validation epoch.
+
+        Args:
+            model: model
+            val_loader: The dataloader yielding the validation batches.
+            limit_batches: Limits the batches during this validation epoch.
+                If greater than the number of batches in the ``val_loader``, this has no effect.
+
+        """
+        # no validation if val_loader wasn't passed
+        if val_loader is None:
+            return
+
+        def on_validation_model_eval(model):
+            model.eval()
+            # requires_grad = True, but loss.backward() raised error
+            # because grad_fn is None
+            torch.set_grad_enabled(False)
+
+        on_validation_model_eval(model)
+
+        def on_validation_epoch_start():
+            pass
+
+        if self.device_id == 0:
+            iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
+            pbar = enumerate(iterable)
+        else:
+            pbar = enumerate(val_loader)
+
+        eval_step = 0
+        tot_batch_logits = list()
+        tot_batch_labels = list()
+
+        if self.metric_on_cpu:
+            metric_on_device = "cpu"
+        else:
+            metric_on_device = model.device
+
+        for batch_idx, batch in pbar:
+            # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,
+            # but it was not much different from outputting the value of GPU 0.
+            # Therefore, all sections except EVAL EPOCH END only output the value of rank 0.
+            tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
+            # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
+
+            # end epoch if stopping training completely or max batches for this epoch reached
+            if self.should_stop or batch_idx >= limit_batches:
+                break
+
+            def on_validation_batch_start(batch, batch_idx):
+                pass
+
+            on_validation_batch_start(batch, batch_idx)
+
+            # TODO(User): fit the input and output for your model architecture!
+            labels = batch.pop("labels")
+
+            outputs = model(**batch)
+            loss = self.criterion(outputs, labels)
+
+            # TODO(User): what do you want to log items every epoch end?
+            tot_batch_logits.append(outputs.to(metric_on_device))
+            tot_batch_labels.append(labels.to(metric_on_device))
+
+            log_output = {"loss": loss}
+            # avoid gradients in stored/accumulated values -> prevents potential OOM
+            self._current_val_return = apply_to_collection(
+                log_output, torch.Tensor, lambda x: x.detach().to(metric_on_device)
+            )
+
+            def on_validation_batch_end(eval_out, batch, batch_idx):
+                pass
+
+            on_validation_batch_end(outputs, batch, batch_idx)
+
+            web_log_every_n(
+                self.web_logger,
+                {
+                    "eval_step/loss": self._current_val_return["loss"],
+                    "eval_step/step": eval_step,
+                    "eval_step/global_step": self.global_step,
+                    "eval_step/epoch": self.current_epoch,
+                },
+                eval_step,
+                self.log_every_n,
+                self.device_id,
+            )
+            if self.device_id == 0:
+                self._format_iterable(iterable, self._current_val_return, "val")
+            eval_step += 1
+
+        # TODO(User): Create any form you want to output to wandb!
+        def on_validation_epoch_end(tot_batch_logits, tot_batch_labels, metric_device):
+            # if you want to see all_reduce example, see `fsdp_train.py`'s eval_loop
+            tot_batch_logits = torch.cat(tot_batch_logits, dim=0)
+            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
+
+            # all_gather` requires a `fixed length tensor` as input.
+            # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
+            local_size = torch.tensor([tot_batch_logits.size(0)], dtype=torch.long, device=metric_device)
+            size_list = [
+                torch.tensor([0], dtype=torch.long, device=metric_device) for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather(size_list, local_size)
+
+            # Create a fixed length tensor with the length of `all_gather`.
+            logits_gathered_data = [
+                torch.zeros(
+                    (size.item(), tot_batch_logits.size(-1)), dtype=tot_batch_logits.dtype, device=metric_device
+                )
+                for size in size_list
+            ]
+            labels_gathered_data = [
+                torch.zeros(
+                    (size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype, device=metric_device
+                )
+                for size in size_list
+            ]
+
+            # Collect and match data from all GPUs.
+            if metric_device == torch.device("cpu"):
+                # Collect and match data from all GPUs.
+                dist.all_gather_object(logits_gathered_data, tot_batch_logits)
+                dist.all_gather_object(labels_gathered_data, tot_batch_labels)
+            else:
+                dist.all_gather(logits_gathered_data, tot_batch_logits)
+                dist.all_gather(labels_gathered_data, tot_batch_labels)
+
+            # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
+            logits_gathered_data = torch.cat(logits_gathered_data, dim=0)
+            labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
+            epoch_loss = self.criterion(logits_gathered_data, labels_gathered_data)
+            epoch_rmse = torch.sqrt(epoch_loss)
+            # epoch monitoring is must doing every epoch
+            web_log_every_n(
+                self.web_logger,
+                {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch},
+                self.current_epoch,
+                1,
+                self.device_id,
+            )
+
+        on_validation_epoch_end(tot_batch_logits, tot_batch_labels, metric_on_device)
+
+        def on_validation_model_train(model):
+            torch.set_grad_enabled(True)
+            model.train()
+
+        on_validation_model_train(model)
+
+
 def main(hparams: TrainingArguments):
+    # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
+    setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
+    seed_everything(hparams.seed)
     world_size = int(os.environ.get("WORLD_SIZE", -1))
     rank = int(os.environ.get("RANK", -1))
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -48,12 +304,9 @@ def main(hparams: TrainingArguments):
     torch.cuda.set_device(local_rank)
     deepspeed.init_distributed("nccl", rank=rank, world_size=world_size)
 
-    # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
-    setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
     web_logger = None
     if local_rank == 0:
         web_logger = wandb.init(config=hparams)
-    seed_everything(hparams.seed)
     os.makedirs(hparams.output_dir, exist_ok=True)
 
     df_train = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
@@ -128,22 +381,6 @@ def main(hparams: TrainingArguments):
         feature_column_name=hparams.feature_column_name,
         labels_column_name=hparams.labels_column_name,
     )
-    # if hparams.eval_datasets_path:
-    #     eval_df = pd.read_csv(hparams.eval_datasets_path)
-    #     train_dataset = PandasDataset(train_df, length_column_name=hparams.length_column_name)
-    # else:
-    #     # it is just for lstm example
-    #     train_df = train_df[::-1]
-    #     train_size = int(len(train_df) * hparams.train_data_ratio)
-    #     splited_train_df = train_df[0:train_size]
-    #     eval_df = train_df[train_size - seq_length :]
-    #     train_dataset = PandasDataset(splited_train_df, length_column_name=hparams.length_column_name)
-    #     # if you use another one, plz check here
-    #     # train_size = int(hparams.train_data_ratio * len(train_df))
-    #     # eval_size = len(train_df) - train_size
-    #     # train_dataset = PandasDataset(hparams.train_datasets_path)
-    #     # train_dataset, eval_dataset = random_split(train_dataset, [train_size, eval_size])
-    # eval_dataset = PandasDataset(eval_df, length_column_name=hparams.length_column_name)
 
     if hparams.group_by_length:
         custom_train_sampler = DistributedLengthGroupedSampler(
@@ -316,7 +553,7 @@ def main(hparams: TrainingArguments):
     """
     logger.debug(log_str)
 
-    trainer = Trainer(
+    trainer = DSTrainer(
         device_id=local_rank,
         precision=hparams.model_dtype,
         cmd_logger=logger,
@@ -327,6 +564,7 @@ def main(hparams: TrainingArguments):
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,
         max_norm=hparams.max_norm,
+        metric_on_cpu=hparams.metric_on_cpu,
     )
 
     trainer.fit(

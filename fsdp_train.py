@@ -182,7 +182,7 @@ class FSDPTrainer(Trainer):
         tot_batch_loss = list()
 
         if self.metric_on_cpu:
-            metric_on_device = "cpu"
+            metric_on_device = torch.device("cpu")
         else:
             metric_on_device = model.device
 
@@ -258,7 +258,7 @@ class FSDPTrainer(Trainer):
                 torch.tensor(0, dtype=device_total_loss.dtype, device=metric_device)
                 for _ in range(dist.get_world_size())
             ]
-            if model.device == torch.device("cpu"):
+            if metric_device == torch.device("cpu"):
                 dist.all_gather_object(size_list, local_size)
                 dist.all_gather_object(loss_list, device_total_loss)
             else:
@@ -278,7 +278,7 @@ class FSDPTrainer(Trainer):
                 torch.zeros(size.item(), dtype=tot_batch_labels.dtype, device=metric_device) for size in size_list
             ]
 
-            if model.device == torch.device("cpu"):
+            if metric_device == torch.device("cpu"):
                 # Collect and match data from all GPUs.
                 dist.all_gather_object(logits_gathered_data, tot_batch_logits)
                 dist.all_gather_object(labels_gathered_data, tot_batch_labels)

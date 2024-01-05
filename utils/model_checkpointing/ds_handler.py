@@ -66,6 +66,7 @@ def load_checkpoint(state: dict, checkpoint_filepath: str, logger=None):
 
 def save_checkpoint(
     model: torch.nn.Module,
+    optimizer,
     scheduler_cfg: dict,
     current_epoch: int,
     global_step: int,
