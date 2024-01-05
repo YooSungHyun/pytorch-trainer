@@ -358,7 +358,7 @@ def apply_to_collections(
 
 
 def tensor_dict_to_device(tensor_dict: Dict[str, torch.Tensor], device: str = "cpu", non_blocking: bool = False):
-    assert isinstance(tensor_dict, dict), f"tensor_dict is not dicts. Found {type(tensor_dict)}."
+    # assert isinstance(tensor_dict, [dict]), f"tensor_dict is not dicts. Found {type(tensor_dict)}."
 
     for k, v in tensor_dict.items():
         if isinstance(v, dict):

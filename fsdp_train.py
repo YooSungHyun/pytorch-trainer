@@ -10,18 +10,25 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import wandb
 from arguments.training_args import TrainingArguments
-
+from typing import Optional, Union
 from trainer.fsdp import Trainer
-from transformers import AutoTokenizer, GPT2TokenizerFast
-from transformers import T5Tokenizer, T5ForConditionalGeneration
-from transformers.models.t5.modeling_t5 import T5Block
-from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers.models.roberta.modeling_roberta import RobertaEncoder
+from datasets import load_dataset, Dataset, concatenate_datasets
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
 from sklearn.preprocessing import MinMaxScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DistributedSampler, random_split
-from utils.comfy import dataclass_to_namespace, seed_everything, bfloat_support, json_to_dict
+from utils.comfy import (
+    dataclass_to_namespace,
+    seed_everything,
+    bfloat_support,
+    json_to_dict,
+    apply_to_collection,
+    web_log_every_n,
+    tensor_dict_to_device,
+)
 from utils.data.summarization_dataset import wikihow
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
@@ -29,7 +36,7 @@ from utils.data.custom_sampler import DistributedLengthGroupedSampler
 from utils.FSDP import mixed_precision
 from utils.FSDP.wrapping import get_transformers_wrapper
 import inspect
-
+import evaluate
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -65,6 +72,233 @@ SHARDING_STRATEGY = {
     "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
     "_HYBRID_SHARD_ZERO2": ShardingStrategy._HYBRID_SHARD_ZERO2,
 }
+
+
+class FSDPTrainer(Trainer):
+    def __init__(
+        self,
+        device_id,
+        eval_metric,
+        cmd_logger=None,
+        web_logger=None,
+        max_epochs: Optional[int] = 1000,
+        max_steps: Optional[int] = None,
+        grad_accum_steps: int = 1,
+        limit_train_batches: Union[int, float] = float("inf"),
+        limit_val_batches: Union[int, float] = float("inf"),
+        validation_frequency: int = 1,
+        use_distributed_sampler: bool = True,
+        checkpoint_dir: str = "./checkpoints",
+        checkpoint_frequency: int = 1,
+        chk_addr_dict: dict = None,
+        non_blocking: bool = True,
+        log_every_n: int = 1,
+        max_norm: float = 0.0,
+    ):
+        super().__init__(
+            device_id,
+            eval_metric,
+            cmd_logger,
+            web_logger,
+            max_epochs,
+            max_steps,
+            grad_accum_steps,
+            limit_train_batches,
+            limit_val_batches,
+            validation_frequency,
+            use_distributed_sampler,
+            checkpoint_dir,
+            checkpoint_frequency,
+            chk_addr_dict,
+            non_blocking,
+            log_every_n,
+            max_norm,
+        )
+
+    def training_step(self, model, batch, batch_idx):
+        # TODO(User): fit the input and output for your model architecture!
+        output = model(**batch)
+        loss = output["loss"]
+
+        def on_before_backward(loss):
+            pass
+
+        on_before_backward(loss)
+
+        loss.backward()
+
+        def on_after_backward():
+            pass
+
+        on_after_backward()
+
+        outputs = {"loss": loss}
+        # avoid gradients in stored/accumulated values -> prevents potential OOM
+        self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
+
+        web_log_every_n(
+            self.web_logger,
+            {
+                "train/loss": self._current_train_return["loss"],
+                "train/step": self.step,
+                "train/global_step": self.global_step,
+                "train/epoch": self.current_epoch,
+            },
+            self.step,
+            self.log_every_n,
+            self.device_id,
+        )
+        return loss
+
+    def eval_loop(
+        self,
+        model,
+        val_loader: Optional[torch.utils.data.DataLoader],
+        limit_batches: Union[int, float] = float("inf"),
+    ):
+        """The validation loop ruunning a single validation epoch.
+
+        Args:
+            model: model
+            val_loader: The dataloader yielding the validation batches.
+            limit_batches: Limits the batches during this validation epoch.
+                If greater than the number of batches in the ``val_loader``, this has no effect.
+
+        """
+        # no validation if val_loader wasn't passed
+        if val_loader is None:
+            return
+
+        def on_validation_model_eval(model):
+            model.eval()
+            # requires_grad = True, but loss.backward() raised error
+            # because grad_fn is None
+            torch.set_grad_enabled(False)
+
+        on_validation_model_eval(model)
+
+        def on_validation_epoch_start():
+            pass
+
+        if self.device_id == 0:
+            iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
+            pbar = enumerate(iterable)
+        else:
+            pbar = enumerate(val_loader)
+
+        eval_step = 0
+        tot_batch_result = list()
+        tot_batch_labels = list()
+        tot_batch_loss = list()
+        for batch_idx, batch in pbar:
+            # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,
+            # but it was not much different from outputting the value of GPU 0.
+            # Therefore, all sections except EVAL EPOCH END only output the value of rank 0.
+            tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
+            # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
+
+            # end epoch if stopping training completely or max batches for this epoch reached
+            if self.should_stop or batch_idx >= limit_batches:
+                break
+
+            def on_validation_batch_start(batch, batch_idx):
+                pass
+
+            on_validation_batch_start(batch, batch_idx)
+
+            # TODO(User): fit the input and output for your model architecture!
+            output = model(**batch)
+            # avoid gradients in stored/accumulated values -> prevents potential OOM
+            self._current_val_return = apply_to_collection(output, torch.Tensor, lambda x: x.detach().to(model.device))
+            loss = self._current_val_return["loss"]
+
+            tot_batch_result.append(output["logits"].to(model.device))
+            tot_batch_labels.append(batch["labels"].to(model.device))
+            tot_batch_loss.append(loss.to(model.device))
+
+            def on_validation_batch_end(eval_out, batch, batch_idx):
+                pass
+
+            on_validation_batch_end(self._current_val_return, batch, batch_idx)
+
+            web_log_every_n(
+                self.web_logger,
+                {
+                    "eval_step/loss": self._current_val_return["loss"],
+                    "eval_step/step": eval_step,
+                    "eval_step/global_step": self.global_step,
+                    "eval_step/epoch": self.current_epoch,
+                },
+                eval_step,
+                self.log_every_n,
+                self.device_id,
+            )
+            cmd_output = {"loss": self._current_val_return["loss"]}
+            if self.device_id == 0:
+                self._format_iterable(iterable, cmd_output, "val")
+            eval_step += 1
+        device_total_loss = torch.mean(torch.tensor(tot_batch_loss, dtype=loss.dtype, device=model.device))
+
+        def on_validation_epoch_end(tot_batch_result, tot_batch_labels, device_total_loss, eval_device):
+            tot_batch_result = torch.cat(tot_batch_result, dim=0)
+            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
+
+            # all_gather` requires a `fixed length tensor` as input.
+            # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
+            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=eval_device)
+            size_list = [torch.tensor([0], dtype=torch.long, device=eval_device) for _ in range(dist.get_world_size())]
+            device_per_loss_list = [
+                torch.tensor(0, dtype=device_total_loss.dtype, device=eval_device)
+                for _ in range(dist.get_world_size())
+            ]
+            if model.device == torch.device("cpu"):
+                dist.all_gather_object(size_list, local_size)
+                dist.all_gather_object(device_per_loss_list, device_total_loss)
+            else:
+                dist.all_gather(size_list, local_size)
+                dist.all_gather(device_per_loss_list, device_total_loss)
+
+            total_loss = torch.tensor(device_per_loss_list).mean()
+
+            # Create a fixed length tensor with the length of `all_gather`.
+            result_gathered_data = [
+                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype, device=eval_device)
+                for size in size_list
+            ]
+            labels_gathered_data = [
+                torch.zeros(size.item(), dtype=tot_batch_labels.dtype, device=eval_device) for size in size_list
+            ]
+
+            if model.device == torch.device("cpu"):
+                # Collect and match data from all GPUs.
+                dist.all_gather_object(result_gathered_data, tot_batch_result)
+                dist.all_gather_object(labels_gathered_data, tot_batch_labels)
+            else:
+                dist.all_gather(result_gathered_data, tot_batch_result)
+                dist.all_gather(labels_gathered_data, tot_batch_labels)
+
+            # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
+            result_gathered_data = torch.cat(result_gathered_data, dim=0)
+            predictions = torch.argmax(result_gathered_data, axis=-1)
+            labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
+
+            total_acc = self.eval_metric.compute(predictions=predictions, references=labels_gathered_data)
+            # epoch monitoring is must doing every epoch
+            web_log_every_n(
+                self.web_logger,
+                {"eval/loss": total_loss, "eval/acc": total_acc, "eval/epoch": self.current_epoch},
+                self.current_epoch,
+                1,
+                self.device_id,
+            )
+
+        on_validation_epoch_end(tot_batch_result, tot_batch_labels, device_total_loss, model.device)
+
+        def on_validation_model_train(model):
+            torch.set_grad_enabled(True)
+            model.train()
+
+        on_validation_model_train(model)
 
 
 def main(hparams: TrainingArguments):
@@ -105,7 +339,7 @@ def main(hparams: TrainingArguments):
         else:
             logger.info("bFloat16 support not present. Will use FP32, and not mixed precision")
 
-    wrapping_policy = get_transformers_wrapper(T5Block)
+    wrapping_policy = get_transformers_wrapper(RobertaEncoder)
 
     # reference: https://github.com/pytorch/examples/blob/main/distributed/FSDP/T5_training.py
     web_logger = None
@@ -114,22 +348,43 @@ def main(hparams: TrainingArguments):
 
     os.makedirs(hparams.output_dir, exist_ok=True)
 
-    model = T5ForConditionalGeneration.from_pretrained(hparams.transformers_model_name)
-    tokenizer = T5Tokenizer.from_pretrained(hparams.transformers_model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(hparams.transformers_model_name, num_labels=2)
+    tokenizer = AutoTokenizer.from_pretrained(hparams.transformers_model_name)
 
-    train_dataset = wikihow(tokenizer, "train", "./raw_data/", 1500, 512, 150, False)
-    eval_dataset = wikihow(tokenizer, "validation", "./raw_data/", 300, 512, 150, False)
+    imdb = load_dataset("imdb")
 
+    def preprocess(examples):
+        tokenized_text = tokenizer(examples["text"], return_token_type_ids=False, return_tensors="pt")
+        examples["input_ids"] = tokenized_text["input_ids"][0]
+        examples["attention_mask"] = tokenized_text["attention_mask"][0]
+        examples["labels"] = int(examples["label"])
+
+        return examples
+
+    def filter_and_min_sample(datasets: Dataset, max_length: int = 512, min_sample_count: dict[str, int] = None):
+        datasets = datasets.filter(lambda x: len(x["input_ids"]) <= max_length)
+        true_datasets = datasets.filter(lambda x: x["labels"] == 1)
+        false_datasets = datasets.filter(lambda x: x["labels"] == 0)
+        if min_sample_count:
+            sampling_count = min(len(true_datasets), len(false_datasets), min_sample_count["all"])
+        else:
+            sampling_count = min(len(true_datasets), len(false_datasets))
+        sampling_true = Dataset.from_dict(true_datasets.shuffle()[:sampling_count])
+        sampling_false = Dataset.from_dict(false_datasets.shuffle()[:sampling_count])
+        result = concatenate_datasets([sampling_true, sampling_false])
+        assert len(result) % 2 == 0, "`split=all` sampling error check plz"
+        return result
+
+    train_dataset = imdb["train"].map(preprocess, remove_columns=imdb["train"].column_names)
+    train_dataset = filter_and_min_sample(train_dataset, tokenizer.model_max_length)
+    eval_dataset = imdb["test"].map(preprocess, remove_columns=imdb["test"].column_names)
+    eval_dataset = filter_and_min_sample(eval_dataset, tokenizer.model_max_length)
+
+    from transformers import DataCollatorWithPadding
+
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
     if local_rank == 0:
         web_logger.watch(model, log_freq=hparams.log_every_n)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=hparams.learning_rate,
-        eps=hparams.optim_eps,
-        betas=(hparams.optim_beta1, hparams.optim_beta2),
-        weight_decay=hparams.weight_decay,
-    )
 
     if hparams.group_by_length:
         custom_train_sampler = DistributedLengthGroupedSampler(
@@ -137,14 +392,14 @@ def main(hparams: TrainingArguments):
             dataset=train_dataset,
             rank=rank,
             seed=hparams.seed,
-            model_input_name="source_ids",
+            model_input_name="input_ids",
         )
         custom_eval_sampler = DistributedLengthGroupedSampler(
             batch_size=hparams.per_device_eval_batch_size,
             dataset=eval_dataset,
             rank=rank,
             seed=hparams.seed,
-            model_input_name="source_ids",
+            model_input_name="input_ids",
         )
     else:
         # DistributedSampler's shuffle: each device get random indices data segment in every epoch
@@ -159,34 +414,8 @@ def main(hparams: TrainingArguments):
     train_kwargs.update(cuda_kwargs)
     test_kwargs.update(cuda_kwargs)
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, **train_kwargs)
-    eval_dataloader = torch.utils.data.DataLoader(eval_dataset, **test_kwargs)
-    # DataLoader's shuffle: one device get random indices dataset in every epoch
-    # example np_dataset is already set (feature)7:1(label), so, it can be all shuffle `True` between sampler and dataloader
-    # TODO(user): If you not needs, just make #comment#
-    # train_dataloader = CustomDataLoader(
-    #     dataset=train_dataset,
-    #     feature_column_name=hparams.feature_column_name,
-    #     labels_column_name=hparams.labels_column_name,
-    #     batch_size=hparams.per_device_train_batch_size,
-    #     sampler=custom_train_sampler,
-    #     num_workers=hparams.num_workers,
-    #     drop_last=hparams.dataloader_drop_last,
-    #     pin_memory=True,
-    #     persistent_workers=True,
-    # )
-
-    # eval_dataloader = CustomDataLoader(
-    #     dataset=eval_dataset,
-    #     feature_column_name=hparams.feature_column_name,
-    #     labels_column_name=hparams.labels_column_name,
-    #     batch_size=hparams.per_device_eval_batch_size,
-    #     sampler=custom_eval_sampler,
-    #     num_workers=hparams.num_workers,
-    #     drop_last=hparams.dataloader_drop_last,
-    #     pin_memory=True,
-    #     persistent_workers=True,
-    # )
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, collate_fn=data_collator, **train_kwargs)
+    eval_dataloader = torch.utils.data.DataLoader(eval_dataset, collate_fn=data_collator, **test_kwargs)
 
     fsdp_model = FSDP(
         model,
@@ -196,6 +425,15 @@ def main(hparams: TrainingArguments):
         device_id=local_rank,
         limit_all_gathers=fsdp_config["limit_all_gathers"],
         cpu_offload=CPUOffload(offload_params=fsdp_config["offload_params"]),
+    )
+
+    # optimizer have to initialize after FSDP
+    optimizer = torch.optim.AdamW(
+        fsdp_model.parameters(),
+        lr=hparams.learning_rate,
+        eps=hparams.optim_eps,
+        betas=(hparams.optim_beta1, hparams.optim_beta2),
+        weight_decay=hparams.weight_decay,
     )
 
     if fsdp_config["fsdp_activation_checkpointing"]:
@@ -208,7 +446,7 @@ def main(hparams: TrainingArguments):
         apply_activation_checkpointing(
             fsdp_model,
             checkpoint_wrapper_fn=non_reentrant_wrapper,
-            check_fn=lambda submodule: isinstance(submodule, T5Block),
+            check_fn=lambda submodule: isinstance(submodule, RobertaEncoder),
         )
 
         def is_forward_signature_columns(module, key):
@@ -228,14 +466,13 @@ def main(hparams: TrainingArguments):
             so we used a hook in nn.module to force the values to be cleaned up before input.
             Since the structure of your model and the section to be checkpointed may be different, please check and modify it before using it.
         """
-        for i in range(len(fsdp_model.encoder.block)):
-            fsdp_model.encoder.block[i]._fsdp_wrapped_module._checkpoint_wrapped_module.register_forward_pre_hook(
-                remove_columns, with_kwargs=True
-            )
-        for i in range(len(fsdp_model.decoder.block)):
-            fsdp_model.decoder.block[i]._fsdp_wrapped_module._checkpoint_wrapped_module.register_forward_pre_hook(
-                remove_columns, with_kwargs=True
-            )
+        fsdp_model.roberta.encoder._fsdp_wrapped_module._checkpoint_wrapped_module.register_forward_pre_hook(
+            remove_columns, with_kwargs=True
+        )
+        # for i in range(len(fsdp_model.decoder.block)):
+        #     fsdp_model.decoder.block[i]._fsdp_wrapped_module._checkpoint_wrapped_module.register_forward_pre_hook(
+        #         remove_columns, with_kwargs=True
+        #     )
 
     # dataloader already calculate len(total_data) / (batch_size * dist.get_world_size())
     # accumulation is always floor
@@ -279,8 +516,8 @@ def main(hparams: TrainingArguments):
     ##########################################
     """
     logger.debug(log_str)
-
-    trainer = Trainer(
+    eval_metric = evaluate.load("accuracy")
+    trainer = FSDPTrainer(
         device_id=local_rank,
         cmd_logger=logger,
         web_logger=web_logger,
@@ -290,6 +527,7 @@ def main(hparams: TrainingArguments):
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,
         max_norm=hparams.max_norm,
+        eval_metric=eval_metric,
     )
 
     trainer.fit(

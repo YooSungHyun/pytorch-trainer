@@ -13,13 +13,14 @@ from utils.model_checkpointing.fsdp_handler import (
     load_distributed_model_checkpoint,
     load_client_state,
 )
-from torch.distributed.fsdp import StateDictType
+from abc import ABCMeta, abstractmethod
 
 
-class Trainer:
+class Trainer(metaclass=ABCMeta):
     def __init__(
         self,
         device_id,
+        eval_metric,
         cmd_logger=None,
         web_logger=None,
         max_epochs: Optional[int] = 1000,
@@ -55,6 +56,7 @@ class Trainer:
             checkpoint_frequency: How many epochs to run before each checkpoint is written.
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
         """
+        self.eval_metric = eval_metric
         self.device_id = device_id  # it is same rank
         self.device = torch.device("cuda:{}".format(device_id))
 
@@ -283,6 +285,20 @@ class Trainer:
 
         on_train_epoch_end()
 
+    @abstractmethod
+    def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:
+        """A single training step, running forward and backward. The optimizer step is called separately, as this is
+        given as a closure to the optimizer step.
+
+        Args:
+            model: model to train
+            batch: the batch to run the forward on
+            batch_idx: index of the current batch w.r.t the current epoch
+
+        """
+        pass
+
+    @abstractmethod
     def eval_loop(
         self,
         model,
@@ -298,183 +314,7 @@ class Trainer:
                 If greater than the number of batches in the ``val_loader``, this has no effect.
 
         """
-        # no validation if val_loader wasn't passed
-        if val_loader is None:
-            return
-
-        def on_validation_model_eval(model):
-            model.eval()
-            # requires_grad = True, but loss.backward() raised error
-            # because grad_fn is None
-            torch.set_grad_enabled(False)
-
-        on_validation_model_eval(model)
-
-        def on_validation_epoch_start():
-            pass
-
-        if self.device_id == 0:
-            iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
-            pbar = enumerate(iterable)
-        else:
-            pbar = enumerate(val_loader)
-
-        eval_step = 0
-        tot_batch_result = list()
-        tot_batch_labels = list()
-
-        for batch_idx, batch in pbar:
-            # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,
-            # but it was not much different from outputting the value of GPU 0.
-            # Therefore, all sections except EVAL EPOCH END only output the value of rank 0.
-            tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
-            # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
-
-            # end epoch if stopping training completely or max batches for this epoch reached
-            if self.should_stop or batch_idx >= limit_batches:
-                break
-
-            def on_validation_batch_start(batch, batch_idx):
-                pass
-
-            on_validation_batch_start(batch, batch_idx)
-
-            # TODO(User): fit the input and output for your model architecture!
-            output = model(
-                input_ids=batch["source_ids"],
-                attention_mask=batch["source_mask"],
-                labels=batch["target_ids"],
-            )
-            loss = output["loss"]
-
-            tot_batch_result.append(output["logits"].to(model.device))
-            tot_batch_labels.append(batch["target_ids"].to(model.device))
-
-            outputs = {"loss": loss}
-            # avoid gradients in stored/accumulated values -> prevents potential OOM
-            self._current_val_return = apply_to_collection(outputs, torch.Tensor, lambda x: x.detach())
-
-            def on_validation_batch_end(eval_out, batch, batch_idx):
-                pass
-
-            on_validation_batch_end(outputs, batch, batch_idx)
-
-            web_log_every_n(
-                self.web_logger,
-                {
-                    "eval_step/loss": self._current_val_return["loss"],
-                    "eval_step/step": eval_step,
-                    "eval_step/global_step": self.global_step,
-                    "eval_step/epoch": self.current_epoch,
-                },
-                eval_step,
-                self.log_every_n,
-                self.device_id,
-            )
-            if self.device_id == 0:
-                self._format_iterable(iterable, self._current_val_return, "val")
-            eval_step += 1
-
-        def on_validation_epoch_end(tot_batch_result, tot_batch_labels, eval_device):
-            eval_metric = CrossEntropyLoss(ignore_index=-100)
-
-            tot_batch_result = torch.cat(tot_batch_result, dim=0)
-            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
-
-            # all_gather` requires a `fixed length tensor` as input.
-            # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
-            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=eval_device)
-            size_list = [torch.tensor([0], dtype=torch.long, device=eval_device) for _ in range(dist.get_world_size())]
-            if model.device == torch.device("cpu"):
-                dist.all_gather_object(size_list, local_size)
-            else:
-                dist.all_gather(size_list, local_size)
-
-            # Create a fixed length tensor with the length of `all_gather`.
-            result_gathered_data = [
-                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype, device=eval_device)
-                for size in size_list
-            ]
-            labels_gathered_data = [
-                torch.zeros((size.item(), tot_batch_labels.size(-1)), dtype=tot_batch_labels.dtype, device=eval_device)
-                for size in size_list
-            ]
-
-            if model.device == torch.device("cpu"):
-                # Collect and match data from all GPUs.
-                dist.all_gather_object(result_gathered_data, tot_batch_result)
-                dist.all_gather_object(labels_gathered_data, tot_batch_labels)
-            else:
-                dist.all_gather(result_gathered_data, tot_batch_result)
-                dist.all_gather(labels_gathered_data, tot_batch_labels)
-
-            # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
-            result_gathered_data = torch.cat(result_gathered_data, dim=0)
-            labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
-
-            total_loss = eval_metric(
-                result_gathered_data.view(-1, result_gathered_data.size(-1)), labels_gathered_data.view(-1)
-            )
-            # epoch monitoring is must doing every epoch
-            web_log_every_n(
-                self.web_logger,
-                {"eval/loss": total_loss, "eval/epoch": self.current_epoch},
-                self.current_epoch,
-                1,
-                self.device_id,
-            )
-
-        on_validation_epoch_end(tot_batch_result, tot_batch_labels, model.device)
-
-        def on_validation_model_train(model):
-            torch.set_grad_enabled(True)
-            model.train()
-
-        on_validation_model_train(model)
-
-    def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:
-        """A single training step, running forward and backward. The optimizer step is called separately, as this is
-        given as a closure to the optimizer step.
-
-        Args:
-            model: model to train
-            batch: the batch to run the forward on
-            batch_idx: index of the current batch w.r.t the current epoch
-
-        """
-        # TODO(User): fit the input and output for your model architecture!
-        output = model(input_ids=batch["source_ids"], attention_mask=batch["source_mask"], labels=batch["target_ids"])
-        loss = output["loss"]
-
-        def on_before_backward(loss):
-            pass
-
-        on_before_backward(loss)
-
-        loss.backward()
-
-        def on_after_backward():
-            pass
-
-        on_after_backward()
-
-        outputs = {"loss": loss}
-        # avoid gradients in stored/accumulated values -> prevents potential OOM
-        self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
-
-        web_log_every_n(
-            self.web_logger,
-            {
-                "train/loss": self._current_train_return["loss"],
-                "train/step": self.step,
-                "train/global_step": self.global_step,
-                "train/epoch": self.current_epoch,
-            },
-            self.step,
-            self.log_every_n,
-            self.device_id,
-        )
-        return loss
+        pass
 
     def step_scheduler(
         self,
