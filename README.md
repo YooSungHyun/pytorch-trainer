@@ -1,4 +1,4 @@
-# pytorch-trainer
+# pytorch-trainer (The best of both worlds, HuggingFace and Torch-Lightning.)
 
 torch 2.0 and cpu, ddp, deepspeed trainer template
 
