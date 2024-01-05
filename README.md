@@ -68,8 +68,8 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [x] deepspeed_trainer - wandb have to using gather or something?
 -   [x] deepspeed_trainer - Reliable wandb logging for distributed learning
 -   [x] fsdp_trainer - change deepspeed to fsdp
--   [ ] fsdp_trainer - test
--   [ ] eval epoch end all_gather on cpu, eval on cpu (?)
+-   [x] fsdp_trainer - test
+-   [x] eval epoch end all_gather on cpu, eval on cpu (?)
 -   [ ] Implement customizable training and eval step inheritance
 -   [ ] inference - ipynb, py3
 -   [ ] huggingface - float16 model is real model dtype is float16? check and applied
