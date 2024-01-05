@@ -47,6 +47,7 @@ class DSTrainer(Trainer):
     def __init__(
         self,
         device_id,
+        eval_metric=None,
         precision="fp32",
         cmd_logger=None,
         web_logger=None,
@@ -66,6 +67,7 @@ class DSTrainer(Trainer):
     ):
         super().__init__(
             device_id,
+            eval_metric,
             precision,
             cmd_logger,
             web_logger,
@@ -239,7 +241,10 @@ class DSTrainer(Trainer):
             size_list = [
                 torch.tensor([0], dtype=torch.long, device=metric_device) for _ in range(dist.get_world_size())
             ]
-            dist.all_gather(size_list, local_size)
+            if metric_device == torch.device("cpu"):
+                dist.all_gather_object(size_list, local_size)
+            else:
+                dist.all_gather(size_list, local_size)
 
             # Create a fixed length tensor with the length of `all_gather`.
             logits_gathered_data = [
@@ -552,9 +557,11 @@ def main(hparams: TrainingArguments):
     ##########################################
     """
     logger.debug(log_str)
-
+    # TODO(User): input your eval_metric
+    eval_metric = None
     trainer = DSTrainer(
         device_id=local_rank,
+        evel_metric=eval_metric,
         precision=hparams.model_dtype,
         cmd_logger=logger,
         web_logger=web_logger,

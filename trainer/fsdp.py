@@ -22,7 +22,7 @@ class Trainer(metaclass=ABCMeta):
     def __init__(
         self,
         device_id,
-        eval_metric,
+        eval_metric=None,
         precision: str = "fp32",
         cmd_logger=None,
         web_logger=None,
@@ -415,7 +415,7 @@ class Trainer(metaclass=ABCMeta):
         assert rank > -1, "RANK can not find, plz check before save!"
 
         load_distributed_model_checkpoint(state["model"], rank, path, self.logger)
-        load_client_state(state, os.path.join(path, "client_state.pt"), state["model"].device, self.logger)
+        load_client_state(state, os.path.join(path, "client_state.pt"), self.device, self.logger)
         self.global_step = state.pop("global_step")
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
