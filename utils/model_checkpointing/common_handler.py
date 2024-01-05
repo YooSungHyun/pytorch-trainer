@@ -123,6 +123,7 @@ def save_checkpoint(
     step: int,
     dtype: torch.dtype,
     checkpoint_filepath: str,
+    grad_scaler=None,
     trainable_loss=None,
     logger=None,
 ):
@@ -173,6 +174,7 @@ def save_checkpoint(
             "model": state_dict,
             "optimizer": optimizer_state_dict,
             "scheduler": scheduler_state_dict,
+            "grad_scaler": grad_scaler,
             "trainable_loss": loss_state_dict,
             "dtype": dtype,
         },

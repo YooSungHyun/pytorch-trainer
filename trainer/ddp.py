@@ -59,17 +59,17 @@ class Trainer:
         self.device_id = device_id  # it is same rank
         self.device = torch.device("cuda:{}".format(device_id))
 
-        self.is_fp16 = False
+        self.mixed_precision = False
         if precision in ["fp16", "float16"]:
             self.precision = precision_dict["fp16"]
-            self.is_fp16 = True
+            self.mixed_precision = True
         elif precision in ["bf16" or "bfloat16"]:
             self.precision = precision_dict["bf16"]
-            self.is_fp16 = True
+            self.mixed_precision = True
         else:
             self.precision = precision_dict["fp32"]
 
-        self.grad_scaler = GradScaler(enabled=self.is_fp16)
+        self.grad_scaler = GradScaler(enabled=self.mixed_precision)
 
         self.logger = cmd_logger
         self.web_logger = web_logger
@@ -360,7 +360,7 @@ class Trainer:
             on_validation_batch_start(batch, batch_idx)
 
             # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-            with autocast(enabled=self.is_fp16, dtype=self.precision):
+            with autocast(enabled=self.mixed_precision, dtype=self.precision):
                 labels = batch.pop("labels")
 
                 outputs = model(**batch)
@@ -451,7 +451,7 @@ class Trainer:
 
         """
         # TODO(User): If you needs more labels than 1, must change this line (make your labels)
-        with autocast(enabled=self.is_fp16, dtype=self.precision):
+        with autocast(enabled=self.mixed_precision, dtype=self.precision):
             labels = batch.pop("labels")
 
             outputs = model(**batch)
@@ -577,9 +577,9 @@ class Trainer:
                 f"Trainer precision {self.precision} not matched load state {state['dtype']} plz check!!!!!!"
             )
             self.precision = state["dtype"]
-            self.is_fp16 = False
+            self.mixed_precision = False
             if self.precision in [torch.float16, torch.bfloat16]:
-                self.is_fp16 = True
+                self.mixed_precision = True
 
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")

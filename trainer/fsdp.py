@@ -1,19 +1,21 @@
 import os
-from collections.abc import Mapping
-from functools import partial
-from typing import Any, Iterable, List, Literal, Optional, Tuple, Union, cast
-import time
-import torch
-from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
-from tqdm import tqdm
-import torch.distributed as dist
-from torch.nn import CrossEntropyLoss
-from utils.model_checkpointing.fsdp_handler import (
-    save_distributed_model_checkpoint,
-    load_distributed_model_checkpoint,
-    load_client_state,
-)
 from abc import ABCMeta, abstractmethod
+from collections.abc import Mapping
+from typing import Any, Iterable, Literal, Optional, Union, cast
+
+import torch
+import torch.distributed as dist
+from torch.cuda.amp import GradScaler
+from tqdm import tqdm
+from utils.comfy import apply_to_collection, tensor_dict_to_device, web_log_every_n
+from utils.model_checkpointing.fsdp_handler import (
+    load_client_state,
+    load_distributed_model_checkpoint,
+    save_distributed_model_checkpoint,
+    save_model_checkpoint,
+)
+
+precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 class Trainer(metaclass=ABCMeta):
@@ -21,6 +23,7 @@ class Trainer(metaclass=ABCMeta):
         self,
         device_id,
         eval_metric,
+        precision: str = "fp32",
         cmd_logger=None,
         web_logger=None,
         max_epochs: Optional[int] = 1000,
@@ -29,39 +32,55 @@ class Trainer(metaclass=ABCMeta):
         limit_train_batches: Union[int, float] = float("inf"),
         limit_val_batches: Union[int, float] = float("inf"),
         validation_frequency: int = 1,
-        use_distributed_sampler: bool = True,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
         non_blocking: bool = True,
         log_every_n: int = 1,
         max_norm: float = 0.0,
+        metric_on_cpu: bool = False,
     ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
 
         Args:
-            loggers: A single logger or a list of loggers.
+            eval_metric: for wandb eval metric
+            cmd_logger: cmd output logger
+            web_loggers: wandb logger
             max_epochs: The maximum number of epochs to train
-            max_steps: The maximum number of (optimizer) steps to train
+            max_steps: The maximum number of (optimizer) steps to train. (not tested)
             grad_accum_steps: How many batches to process before each optimizer step
             limit_train_batches: Limits the number of train batches per epoch
                 If greater than number of batches in the dataloader, this has no effect.
             limit_val_batches: Limits the number of validation batches per epoch.
                 If greater than number of batches in the dataloader, this has no effect.
             validation_frequency: How many epochs to run before each validation epoch.
-            use_distributed_sampler: Wraps the sampler of each dataloader with a respective distributed-aware sampler
-                in case of distributed training.
             checkpoint_dir: Directory to store checkpoints to.
-            checkpoint_frequency: How many epochs to run before each checkpoint is written.
+            checkpoint_frequency: How many epochs to run before each checkpoint is written. (not implemented)
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
+            log_every_n: every log per n steps
+            max_norm: gradient clipping
+            metric_on_cpu: metric calculate on cpu?
         """
         self.eval_metric = eval_metric
-        self.device_id = device_id  # it is same rank
+        self.device_id = device_id  # it is same local rank
         self.device = torch.device("cuda:{}".format(device_id))
+
+        self.mixed_precision = False
+        if precision in ["fp16", "float16"]:
+            self.precision = precision_dict["fp16"]
+            self.mixed_precision = True
+        elif precision in ["bf16" or "bfloat16"]:
+            self.precision = precision_dict["bf16"]
+            self.mixed_precision = True
+        else:
+            self.precision = precision_dict["fp32"]
+
+        self.grad_scaler = GradScaler(enabled=self.mixed_precision)
 
         self.logger = cmd_logger
         self.web_logger = web_logger
+        # when i debug dict inplace, it is so useful
         self.chk_addr_dict = chk_addr_dict
 
         self.global_step = 0
@@ -85,7 +104,6 @@ class Trainer(metaclass=ABCMeta):
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.validation_frequency = validation_frequency
-        self.use_distributed_sampler = use_distributed_sampler
         self._current_train_return: Union[torch.Tensor, Mapping[str, Any]] = {}
         self._current_val_return: Optional[Union[torch.Tensor, Mapping[str, Any]]] = {}
 
@@ -96,6 +114,7 @@ class Trainer(metaclass=ABCMeta):
         self.log_every_n = log_every_n
 
         self.max_norm = max_norm
+        self.metric_on_cpu = metric_on_cpu
 
     def fit(
         self,
@@ -108,23 +127,14 @@ class Trainer(metaclass=ABCMeta):
         trainable_loss=None,
         ckpt_path: Optional[str] = None,
     ):
-        """The main entrypoint of the trainer, triggering the actual training.
-
-        Args:
-            model: model
-            train_loader: the training dataloader. Has to be an iterable returning batches.
-            val_loader: the validation dataloader. Has to be an iterable returning batches.
-                If not specified, no validation will run.
-            ckpt_path: Path to previous checkpoints to resume training from.
-                If specified, will always look for the latest checkpoint within the given directory.
-
-        """
+        """The main entrypoint of the trainer, triggering the actual training."""
         # assemble state (current epoch and global step will be added in save)
         state = {
             "model": model,
             "optimizer": optimizer,
             "scheduler_cfg": scheduler_cfg,
             "trainable_loss": trainable_loss,
+            "grad_scaler": self.grad_scaler,
         }
 
         # load last checkpoint if available
@@ -237,7 +247,12 @@ class Trainer(metaclass=ABCMeta):
                     self.device_id,
                 )
 
-                optimizer.step()
+                if self.max_norm > 0.0:
+                    self.grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.max_norm)
+
+                self.grad_scaler.step(optimizer)
+                self.grad_scaler.update()
 
                 def on_before_zero_grad(optimizer):
                     pass
@@ -404,6 +419,7 @@ class Trainer(metaclass=ABCMeta):
         self.global_step = state.pop("global_step")
         self.step = state.pop("step")
         self.current_epoch = state.pop("current_epoch")
+        self.grad_scaler = state.pop("grad_scaler")
 
         if state:
             self.logger.info(f"Unused Checkpoint Values: {state}, returned GPU-{self.device_id}")
@@ -429,7 +445,7 @@ class Trainer(metaclass=ABCMeta):
         dist.barrier()
 
         save_distributed_model_checkpoint(state["model"], checkpoint_epoch_folder)
-
+        save_model_checkpoint(state["model"], rank, checkpoint_epoch_folder, self.logger)
         if rank == 0:
             optimizer_state_dict = None
             if state["optimizer"] is not None:
@@ -450,6 +466,7 @@ class Trainer(metaclass=ABCMeta):
                     loss_state_dict = state["trainable_loss"].module.state_dict()
                 else:
                     loss_state_dict = state["trainable_loss"].state_dict()
+            # grad scaler is memorize loss scale, so have to save
             torch.save(
                 {
                     "optimizer": optimizer_state_dict,
@@ -457,6 +474,7 @@ class Trainer(metaclass=ABCMeta):
                     "global_step": self.global_step,
                     "step": self.step,
                     "scheduler": scheduler_state_dict,
+                    "grad_scaler": self.grad_scaler,
                     "trainable_loss": loss_state_dict,
                 },
                 os.path.join(checkpoint_epoch_folder, "client_state.pt"),

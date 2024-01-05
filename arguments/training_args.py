@@ -8,6 +8,7 @@ class TrainingArguments:
 
     train_datasets_path: str = None
     eval_datasets_path: str = None
+    metric_on_cpu: bool = False
     transformers_model_name: str = None
     train_data_ratio: float = 0.7
     seed: int = None  # all seed

@@ -1,60 +1,44 @@
+import inspect
 import logging
 import math
 import os
+from functools import partial
 from logging import StreamHandler
+from typing import Optional, Union
 
-import numpy as np
-import pandas as pd
+import evaluate
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import wandb
 from arguments.training_args import TrainingArguments
-from typing import Optional, Union
-from trainer.fsdp import Trainer
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from transformers.models.roberta.modeling_roberta import RobertaEncoder
-from datasets import load_dataset, Dataset, concatenate_datasets
+from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
-from sklearn.preprocessing import MinMaxScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DistributedSampler, random_split
-from utils.comfy import (
-    dataclass_to_namespace,
-    seed_everything,
-    bfloat_support,
-    json_to_dict,
-    apply_to_collection,
-    web_log_every_n,
-    tensor_dict_to_device,
-)
-from utils.data.summarization_dataset import wikihow
-from utils.data.custom_dataloader import CustomDataLoader
-from utils.data.custom_sampler import DistributedLengthGroupedSampler
-
-from utils.FSDP import mixed_precision
-from utils.FSDP.wrapping import get_transformers_wrapper
-import inspect
-import evaluate
-
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    CPUOffload,
-    MixedPrecision,
-    BackwardPrefetch,
-    ShardingStrategy,
-    FullStateDictConfig,
-    StateDictType,
-)
-
-from functools import partial
+from torch.cuda.amp import autocast
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
     CheckpointImpl,
     apply_activation_checkpointing,
+    checkpoint_wrapper,
 )
-
+from torch.distributed.fsdp import CPUOffload
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+from torch.utils.data import DistributedSampler
+from trainer.fsdp import Trainer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers.models.roberta.modeling_roberta import RobertaEncoder
+from utils.comfy import (
+    apply_to_collection,
+    bfloat_support,
+    dataclass_to_namespace,
+    json_to_dict,
+    seed_everything,
+    tensor_dict_to_device,
+    web_log_every_n,
+)
+from utils.data.custom_sampler import DistributedLengthGroupedSampler
+from utils.FSDP import mixed_precision
+from utils.FSDP.wrapping import get_transformers_wrapper
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -74,11 +58,13 @@ SHARDING_STRATEGY = {
 }
 
 
+# TODO(User): override training_step and eval_loop for your style
 class FSDPTrainer(Trainer):
     def __init__(
         self,
         device_id,
         eval_metric,
+        precision: str = "fp32",
         cmd_logger=None,
         web_logger=None,
         max_epochs: Optional[int] = 1000,
@@ -94,10 +80,12 @@ class FSDPTrainer(Trainer):
         non_blocking: bool = True,
         log_every_n: int = 1,
         max_norm: float = 0.0,
+        metric_on_cpu: bool = False,
     ):
         super().__init__(
             device_id,
             eval_metric,
+            precision,
             cmd_logger,
             web_logger,
             max_epochs,
@@ -113,28 +101,30 @@ class FSDPTrainer(Trainer):
             non_blocking,
             log_every_n,
             max_norm,
+            metric_on_cpu,
         )
 
     def training_step(self, model, batch, batch_idx):
         # TODO(User): fit the input and output for your model architecture!
-        output = model(**batch)
-        loss = output["loss"]
+        with autocast(enabled=self.mixed_precision, dtype=self.precision):
+            output = model(**batch)
+            loss = output["loss"]
 
         def on_before_backward(loss):
             pass
 
         on_before_backward(loss)
 
-        loss.backward()
+        self.grad_scaler.scale(loss).backward()
 
         def on_after_backward():
             pass
 
         on_after_backward()
 
-        outputs = {"loss": loss}
+        log_output = {"loss": loss}
         # avoid gradients in stored/accumulated values -> prevents potential OOM
-        self._current_train_return = apply_to_collection(outputs, dtype=torch.Tensor, function=lambda x: x.detach())
+        self._current_train_return = apply_to_collection(log_output, dtype=torch.Tensor, function=lambda x: x.detach())
 
         web_log_every_n(
             self.web_logger,
@@ -187,9 +177,15 @@ class FSDPTrainer(Trainer):
             pbar = enumerate(val_loader)
 
         eval_step = 0
-        tot_batch_result = list()
+        tot_batch_logits = list()
         tot_batch_labels = list()
         tot_batch_loss = list()
+
+        if self.metric_on_cpu:
+            metric_on_device = "cpu"
+        else:
+            metric_on_device = model.device
+
         for batch_idx, batch in pbar:
             # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,
             # but it was not much different from outputting the value of GPU 0.
@@ -207,14 +203,21 @@ class FSDPTrainer(Trainer):
             on_validation_batch_start(batch, batch_idx)
 
             # TODO(User): fit the input and output for your model architecture!
-            output = model(**batch)
+            # Model is float32 but can calculate fp16 safety!
+            with autocast(enabled=self.mixed_precision, dtype=self.precision):
+                output = model(**batch)
+
             # avoid gradients in stored/accumulated values -> prevents potential OOM
-            self._current_val_return = apply_to_collection(output, torch.Tensor, lambda x: x.detach().to(model.device))
+            self._current_val_return = apply_to_collection(
+                output, torch.Tensor, lambda x: x.detach().to(metric_on_device)
+            )
+
             loss = self._current_val_return["loss"]
 
-            tot_batch_result.append(output["logits"].to(model.device))
-            tot_batch_labels.append(batch["labels"].to(model.device))
-            tot_batch_loss.append(loss.to(model.device))
+            # TODO(User): what do you want to log items every epoch end?
+            tot_batch_logits.append(output["logits"].to(metric_on_device))
+            tot_batch_labels.append(batch["labels"].to(metric_on_device))
+            tot_batch_loss.append(loss.to(metric_on_device))
 
             def on_validation_batch_end(eval_out, batch, batch_idx):
                 pass
@@ -237,52 +240,58 @@ class FSDPTrainer(Trainer):
             if self.device_id == 0:
                 self._format_iterable(iterable, cmd_output, "val")
             eval_step += 1
-        device_total_loss = torch.mean(torch.tensor(tot_batch_loss, dtype=loss.dtype, device=model.device))
 
-        def on_validation_epoch_end(tot_batch_result, tot_batch_labels, device_total_loss, eval_device):
-            tot_batch_result = torch.cat(tot_batch_result, dim=0)
+        device_total_loss = torch.mean(torch.tensor(tot_batch_loss, dtype=loss.dtype, device=metric_on_device))
+
+        # TODO(User): Create any form you want to output to wandb!
+        def on_validation_epoch_end(tot_batch_logits, tot_batch_labels, device_total_loss, metric_device):
+            tot_batch_logits = torch.cat(tot_batch_logits, dim=0)
             tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
 
             # all_gather` requires a `fixed length tensor` as input.
             # Since the length of the data on each GPU may be different, the length should be passed to `all_gather` first.
-            local_size = torch.tensor([tot_batch_result.size(0)], dtype=torch.long, device=eval_device)
-            size_list = [torch.tensor([0], dtype=torch.long, device=eval_device) for _ in range(dist.get_world_size())]
-            device_per_loss_list = [
-                torch.tensor(0, dtype=device_total_loss.dtype, device=eval_device)
+            local_size = torch.tensor([tot_batch_logits.size(0)], dtype=torch.long, device=metric_device)
+            size_list = [
+                torch.tensor([0], dtype=torch.long, device=metric_device) for _ in range(dist.get_world_size())
+            ]
+            loss_list = [
+                torch.tensor(0, dtype=device_total_loss.dtype, device=metric_device)
                 for _ in range(dist.get_world_size())
             ]
             if model.device == torch.device("cpu"):
                 dist.all_gather_object(size_list, local_size)
-                dist.all_gather_object(device_per_loss_list, device_total_loss)
+                dist.all_gather_object(loss_list, device_total_loss)
             else:
                 dist.all_gather(size_list, local_size)
-                dist.all_gather(device_per_loss_list, device_total_loss)
+                dist.all_gather(loss_list, device_total_loss)
 
-            total_loss = torch.tensor(device_per_loss_list).mean()
+            total_loss = torch.tensor(loss_list).mean()
 
             # Create a fixed length tensor with the length of `all_gather`.
-            result_gathered_data = [
-                torch.zeros((size.item(), tot_batch_result.size(-1)), dtype=tot_batch_result.dtype, device=eval_device)
+            logits_gathered_data = [
+                torch.zeros(
+                    (size.item(), tot_batch_logits.size(-1)), dtype=tot_batch_logits.dtype, device=metric_device
+                )
                 for size in size_list
             ]
             labels_gathered_data = [
-                torch.zeros(size.item(), dtype=tot_batch_labels.dtype, device=eval_device) for size in size_list
+                torch.zeros(size.item(), dtype=tot_batch_labels.dtype, device=metric_device) for size in size_list
             ]
 
             if model.device == torch.device("cpu"):
                 # Collect and match data from all GPUs.
-                dist.all_gather_object(result_gathered_data, tot_batch_result)
+                dist.all_gather_object(logits_gathered_data, tot_batch_logits)
                 dist.all_gather_object(labels_gathered_data, tot_batch_labels)
             else:
-                dist.all_gather(result_gathered_data, tot_batch_result)
+                dist.all_gather(logits_gathered_data, tot_batch_logits)
                 dist.all_gather(labels_gathered_data, tot_batch_labels)
 
             # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
-            result_gathered_data = torch.cat(result_gathered_data, dim=0)
-            predictions = torch.argmax(result_gathered_data, axis=-1)
-            labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
+            logits_gathered_data = torch.cat(logits_gathered_data, dim=0)
+            predictions = torch.argmax(logits_gathered_data, axis=-1)
+            references = torch.cat(labels_gathered_data, dim=0)
 
-            total_acc = self.eval_metric.compute(predictions=predictions, references=labels_gathered_data)
+            total_acc = self.eval_metric.compute(predictions=predictions, references=references)
             # epoch monitoring is must doing every epoch
             web_log_every_n(
                 self.web_logger,
@@ -292,7 +301,7 @@ class FSDPTrainer(Trainer):
                 self.device_id,
             )
 
-        on_validation_epoch_end(tot_batch_result, tot_batch_labels, device_total_loss, model.device)
+        on_validation_epoch_end(tot_batch_logits, tot_batch_labels, device_total_loss, metric_on_device)
 
         def on_validation_model_train(model):
             torch.set_grad_enabled(True)
@@ -302,6 +311,7 @@ class FSDPTrainer(Trainer):
 
 
 def main(hparams: TrainingArguments):
+    # reference: https://github.com/pytorch/examples/blob/main/distributed/FSDP/T5_training.py
     setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
     seed_everything(hparams.seed)
     dist.init_process_group("nccl")
@@ -339,9 +349,9 @@ def main(hparams: TrainingArguments):
         else:
             logger.info("bFloat16 support not present. Will use FP32, and not mixed precision")
 
+    # TODO(User): you have to input your fsdp model layer
     wrapping_policy = get_transformers_wrapper(RobertaEncoder)
 
-    # reference: https://github.com/pytorch/examples/blob/main/distributed/FSDP/T5_training.py
     web_logger = None
     if local_rank == 0:
         web_logger = wandb.init(config=hparams)
@@ -387,6 +397,7 @@ def main(hparams: TrainingArguments):
         web_logger.watch(model, log_freq=hparams.log_every_n)
 
     if hparams.group_by_length:
+        # TODO(User): model_input_name is changed by your dataset's lengths column!
         custom_train_sampler = DistributedLengthGroupedSampler(
             batch_size=hparams.per_device_train_batch_size,
             dataset=train_dataset,
@@ -443,6 +454,7 @@ def main(hparams: TrainingArguments):
             checkpoint_impl=CheckpointImpl.NO_REENTRANT,
         )
         # apply activation checkpointing to model returns None as model is updated directly
+        # TODO(User): Input your fsdp model layer in check_fn!
         apply_activation_checkpointing(
             fsdp_model,
             checkpoint_wrapper_fn=non_reentrant_wrapper,
@@ -490,6 +502,8 @@ def main(hparams: TrainingArguments):
     # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
     lr_scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}
     assert id(scheduler) == id(lr_scheduler["scheduler"])
+
+    # this example is not needs criterion and trainable_loss
     criterion = None
     trainable_loss = None
 
@@ -516,9 +530,12 @@ def main(hparams: TrainingArguments):
     ##########################################
     """
     logger.debug(log_str)
+    # TODO(User): input your eval_metric
     eval_metric = evaluate.load("accuracy")
     trainer = FSDPTrainer(
         device_id=local_rank,
+        precision=hparams.model_dtype,
+        eval_metric=eval_metric,
         cmd_logger=logger,
         web_logger=web_logger,
         max_epochs=hparams.max_epochs,
@@ -527,7 +544,7 @@ def main(hparams: TrainingArguments):
         checkpoint_dir=hparams.output_dir,
         log_every_n=hparams.log_every_n,
         max_norm=hparams.max_norm,
-        eval_metric=eval_metric,
+        metric_on_cpu=hparams.metric_on_cpu,
     )
 
     trainer.fit(
@@ -543,7 +560,6 @@ def main(hparams: TrainingArguments):
 
     from utils.model_checkpointing.fsdp_handler import save_model_checkpoint
 
-    save_model_checkpoint(fsdp_model, rank, os.path.join(hparams.output_dir, "final"), logger)
     if local_rank == 0:
         web_logger.finish(exit_code=0)
     dist.destroy_process_group()

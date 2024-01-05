@@ -1,9 +1,6 @@
 import os
 from pathlib import Path
-from datetime import datetime
 import torch
-import time
-from typing_extensions import TypeGuard
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     StateDictType,
@@ -12,22 +9,8 @@ from torch.distributed.fsdp import (
     # ShardedStateDictConfig, # un-flattened param but shards, usable by other parallel schemes.
 )
 
-from torch.distributed._shard.checkpoint import (
-    FileSystemReader,
-    FileSystemWriter,
-    save_state_dict,
-    load_state_dict,
-)
-from torch.distributed.checkpoint.default_planner import (
-    DefaultSavePlanner,
-    DefaultLoadPlanner,
-)
+from torch.distributed._shard.checkpoint import FileSystemReader, FileSystemWriter, save_state_dict, load_state_dict
 
-
-# from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
-import torch.distributed._shard.checkpoint as dist_cp
-import torch.distributed as dist
-from typing import Generator
 
 # create singleton saving policies to avoid making over and over
 fullstate_save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -44,7 +27,7 @@ def save_model_checkpoint(model, rank, checkpoint_folder, logger=None):
     if rank == 0:
         logger.info("--> saving model ...")
         # create save path
-        save_full_path = os.path.join(checkpoint_folder, "final_model.pt")
+        save_full_path = os.path.join(checkpoint_folder, "total_model.pt")
 
         # save model
         torch.save(cpu_state, save_full_path)
