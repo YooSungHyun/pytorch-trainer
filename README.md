@@ -85,7 +85,7 @@ The `ZeRO` test is not accurate because the model was run with an lstm.
 
 Since the LSTM requires contiguous parameters to be fully guaranteed, the partitioning(cpu-gpu) may not have worked well.
 
-![lstm warning](./readme_lstm.png)
+![lstm warning](./readme_img/readme_lstm.png)
 
 Also, I have some doubts about the CPU offload performance because I used TORCH OPTIMIZED ADAMW, not DEEPSPEED OPTIMIZED ADAMW.
 

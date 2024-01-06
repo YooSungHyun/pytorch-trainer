@@ -1,0 +1,17 @@
+{
+    "name": "torch-inference: cpu",
+    "type": "python",
+    "request": "launch",
+    "program": "cpu_inference.py",
+    "console": "integratedTerminal",
+    "justMyCode": false,
+    "subProcess": true,
+    "env": {},
+    "cwd": "${workspaceFolder}/pytorch-trainer",
+    "args": [
+        "--seed=42",
+        "--data_path=./raw_data/pollution_test_data1.csv",
+        "--model_path=./cpu_outputs/epoch-0050.ckpt",
+        "--metric_on_cpu=True"
+    ]
+}

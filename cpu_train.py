@@ -224,7 +224,6 @@ def main(hparams: TrainingArguments):
     setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
     web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
-    os.makedirs(hparams.output_dir, exist_ok=True)
 
     df_train = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
     # Kaggle author Test Final RMSE: 0.06539
