@@ -106,11 +106,11 @@ I think, optim offload is good but, param offload is strange...
 # Infer Result
 >   `distributed learning` will shuffle the data for each GPU <br />
 >   so you won't be able to find the source specified here up to scaler. <br />
-| category            | image                                                      |
-| ------------------- | ---------------------------------------------------------- |
-| label               | ![label result warning](./readme_img/cpu_infer_result.png) |
-| CPU                 | ![cpu result warning](./readme_img/cpu_infer_result.png)   |
-| DDP                 | ![ddp result warning](./readme_img/ddp_infer_result.png)   |
+| category            | image                                                        |
+| ------------------- | ------------------------------------------------------------ |
+| label               | ![label result warning](./readme_img/kaggle_lstm_result.png) |
+| CPU                 | ![cpu result warning](./readme_img/cpu_infer_result.png)     |
+| DDP                 | ![ddp result warning](./readme_img/ddp_infer_result.png)     |
 
 # Unsupported list
 
