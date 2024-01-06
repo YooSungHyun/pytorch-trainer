@@ -62,10 +62,13 @@ class Trainer(metaclass=ABCMeta):
         self.eval_metric = eval_metric
 
         # in deepspeed, precision is just using model log for .pt file
+        self.mixed_precision = False
         if precision in ["fp16", "float16"]:
             self.precision = precision_dict["fp16"]
+            self.mixed_precision = True
         elif precision in ["bf16" or "bfloat16"]:
             self.precision = precision_dict["bf16"]
+            self.mixed_precision = True
         else:
             self.precision = precision_dict["fp32"]
 

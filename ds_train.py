@@ -30,9 +30,10 @@ from utils.comfy import (
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
 from utils.data.np_dataset import NumpyDataset
+from torch.cuda.amp import autocast
 
 # it is only lstm example.
-# torch.backends.cudnn.enabled = False
+torch.backends.cudnn.enabled = False
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -101,10 +102,12 @@ class DSTrainer(Trainer):
 
         """
         # TODO(User): fit the input and output for your model architecture!
-        labels = batch.pop("labels")
+        with autocast(enabled=self.mixed_precision, dtype=self.precision):
+            labels = batch.pop("labels")
 
-        output = model(**batch)
-        loss = self.criterion(output, labels)
+            # SUPER IMPORTANT, Deepspeed auto_cast is only working on `*args` not `**kwargs`!!!!
+            output = model(**batch)
+            loss = self.criterion(output, labels)
 
         def on_before_backward(loss):
             pass
@@ -197,10 +200,14 @@ class DSTrainer(Trainer):
             on_validation_batch_start(batch, batch_idx)
 
             # TODO(User): fit the input and output for your model architecture!
-            labels = batch.pop("labels")
+            with autocast(enabled=self.mixed_precision, dtype=self.precision):
+                # if self.precision == torch.bfloat16:
+                # tensor_dict_to_dtype(batch, self.precision)
 
-            outputs = model(**batch)
-            loss = self.criterion(outputs, labels)
+                labels = batch.pop("labels")
+
+                outputs = model(**batch)
+                loss = self.criterion(outputs, labels)
 
             # TODO(User): what do you want to log items every epoch end?
             tot_batch_logits.append(outputs.to(metric_on_device))
@@ -460,6 +467,12 @@ def main(hparams: TrainingArguments):
     #     beta1=hparams.optim_beta1,
     #     weight_decay=hparams.weight_decay,
     # )
+
+    # If you use torch optim and scheduler, It can have unexpected behavior. The current implementation is written for the worst case scenario.
+    # For some reason, I was found that `loss` is not `auto_cast`, so in the current example, `auto_cast` manually.
+    # and BF16 `auto_cast` is not supported now (https://github.com/microsoft/DeepSpeed/issues/4772) it is manually implement too.
+    # The optimizer will use zero_optimizer as normal, and the grad_scaler is expected to behave normally, since the id check is done.
+    # https://github.com/microsoft/DeepSpeed/issues/4908
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=hparams.learning_rate,
@@ -532,6 +545,11 @@ def main(hparams: TrainingArguments):
     # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
     lr_scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}
     assert id(scheduler) == id(lr_scheduler["scheduler"]), "scheduler mismatch! plz check!!!!"
+    assert (
+        id(optimizer.param_groups[0])
+        == id(lr_scheduler["scheduler"].optimizer.param_groups[0])
+        == id(model.optimizer.param_groups[0])
+    ), "optimizer is something changed check id!"
     criterion = torch.nn.MSELoss()
     trainable_loss = None
 

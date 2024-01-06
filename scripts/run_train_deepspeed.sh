@@ -1,8 +1,8 @@
 #!/bin/bash
 export OMP_NUM_THREADS=8
 export CUDA_LAUNCH_BLOCKING=1
-export WANDB_DISABLED=false
 export TOKENIZERS_PARALLELISM=false
+export WANDB_DISABLED=true
 export WANDB_PROJECT="torch-trainer"
 export WANDB_ENTITY=""
 export WANDB_NAME="ds-lstm"
@@ -22,9 +22,10 @@ deepspeed --include localhost:0,1,2,3 --master_port 61000 ./ds_train.py \
     --learning_rate=0.001 \
     --weight_decay=0.0001 \
     --warmup_ratio=0.01 \
-    --div_factor=25 \
+    --div_factor=10 \
     --final_div_factor=10 \
     --dataloader_drop_last=False \
     --sampler_shuffle=True \
     --log_every_n=100 \
-    --deepspeed_config=ds_config/zero3.json
+    --model_dtype=fp16 \
+    --deepspeed_config=ds_config/zero2.json
