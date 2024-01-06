@@ -162,6 +162,7 @@ cython_debug/
 ddp_outputs
 cpu_outputs
 ds_outputs
+fsdp_outputs
 logs
 DeepSpeed
 wandb

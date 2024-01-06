@@ -2,10 +2,12 @@ import logging
 import math
 import os
 from logging import StreamHandler
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
+from torch._tensor import Tensor
 import torch.distributed as dist
 from arguments.inference_args import InferenceArguments
 from networks.models import Net
@@ -38,7 +40,9 @@ logger.addHandler(timeFileHandler)
 
 
 class DDPTrainer(Trainer):
-    def __init__(self, device_id, eval_metric, precision="fp32", cmd_logger=None, metric_on_cpu: bool = False) -> None:
+    def __init__(
+        self, device_id, criterion, eval_metric, precision="fp32", cmd_logger=None, metric_on_cpu: bool = False
+    ) -> None:
         """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
         featureset. As a trainer with more included features, we recommend using the
 
@@ -61,6 +65,7 @@ class DDPTrainer(Trainer):
         """
         super().__init__(
             device_id,
+            criterion,
             eval_metric,
             precision,
             cmd_logger,
@@ -138,7 +143,7 @@ class DDPTrainer(Trainer):
             eval_step += 1
 
         # TODO(User): Create any form you want to output to wandb!
-        def on_test_epoch_end(tot_batch_logits, tot_batch_labels, metric_device):
+        def on_test_epoch_end(tot_batch_logits, tot_batch_labels, metric_device, **kwargs):
             tot_batch_logits = torch.cat(tot_batch_logits, dim=0)
             tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
 
@@ -176,23 +181,24 @@ class DDPTrainer(Trainer):
                 dist.all_gather(logits_gathered_data, tot_batch_logits)
                 dist.all_gather(labels_gathered_data, tot_batch_labels)
 
-            # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
-            logits_gathered_data = torch.cat(logits_gathered_data, dim=0)
-            labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
-            epoch_loss = self.criterion(logits_gathered_data, labels_gathered_data)
-            epoch_rmse = torch.sqrt(epoch_loss)
-            self.logger.info(f"RMSE Loss is {epoch_rmse:0.10f}")
+            if self.device_id == 0:
+                # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
+                logits_gathered_data = torch.cat(logits_gathered_data, dim=0)
+                labels_gathered_data = torch.cat(labels_gathered_data, dim=0)
+                epoch_loss = self.criterion(logits_gathered_data, labels_gathered_data)
+                epoch_rmse = torch.sqrt(epoch_loss)
+                self.logger.info(f"RMSE Loss is {epoch_rmse:0.10f}")
+                if self.precision == torch.bfloat16:
+                    pred = logits_gathered_data.to(torch.float32).cpu().numpy()
+                else:
+                    pred = logits_gathered_data.cpu().numpy()
+                # distributed will shuffle the data for each GPU
+                # so you won't be able to find the source specified here up to scaler.
+                np_outputs = np.concatenate([pred, labels_gathered_data.cpu().numpy()], axis=1)
+                pd_result = pd.DataFrame(np_outputs, columns=["pred", "labels"])
+                pd_result.to_excel("./ddp_result.xlsx", index=False)
 
-        on_test_epoch_end(tot_batch_logits, tot_batch_labels, metric_on_device)
-
-        # np_outputs = np.concatenate([outputs, df_test_scaled[n_past:, 1:]], axis=1)
-        # np_labels = df_test_scaled[n_past:]
-        # np_outputs = scaler.inverse_transform(np_outputs)
-        # np_labels = scaler.inverse_transform(np_labels)
-
-        # result = np.concatenate([np_outputs[:, [0]], np_labels[:, [0]]], axis=1)
-        # pd_result = pd.DataFrame(result, columns=["pred", "labels"])
-        # pd_result.to_excel("./cpu_result.xlsx", index=False)
+        on_test_epoch_end(tot_batch_logits, tot_batch_labels, metric_on_device, **kwargs)
 
 
 def main(hparams: InferenceArguments):
@@ -251,6 +257,11 @@ def main(hparams: InferenceArguments):
 
     n_future = 1
     n_past = 11
+
+    np_labels = df_test_scaled[n_past:]
+    index_column = np.arange(np_labels.shape[0]).reshape(-1, 1)
+    np_idx_labels = np.concatenate([index_column, np_labels], axis=1)
+
     #  Test Sets
     x = []
     y = []
@@ -292,17 +303,6 @@ def main(hparams: InferenceArguments):
         persistent_workers=True,
     )
 
-    precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
-    mixed_precision = False
-    if hparams.model_dtype in ["fp16", "float16"]:
-        hparams.model_dtype = precision_dict["fp16"]
-        mixed_precision = True
-    elif hparams.model_dtype in ["bf16" or "bfloat16"]:
-        hparams.model_dtype = precision_dict["bf16"]
-        mixed_precision = True
-    else:
-        hparams.model_dtype = precision_dict["fp32"]
-
     model = Net().cuda(local_rank)
     ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
@@ -318,7 +318,11 @@ def main(hparams: InferenceArguments):
         cmd_logger=logger,
         metric_on_cpu=hparams.metric_on_cpu,
     )
-    trainer.test_loop(model=ddp_model, test_loader=test_dataloader, df_test_scaled=df_test_scaled, scaler=scaler)
+    trainer.test_loop(
+        model=ddp_model, test_loader=test_dataloader, np_idx_labels=np_idx_labels, scaler=scaler, n_past=n_past
+    )
+
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

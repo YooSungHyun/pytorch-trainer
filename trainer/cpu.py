@@ -262,21 +262,19 @@ class Trainer(metaclass=ABCMeta):
 
         on_train_epoch_end()
 
-    @abstractmethod
     def eval_loop(
         self,
         model,
         val_loader: Optional[torch.utils.data.DataLoader],
         limit_batches: Union[int, float] = float("inf"),
     ):
-        pass
+        raise NotImplementedError("If you used eval_loop, plz implement first!")
 
     def test_loop(self, model, test_loader: Optional[torch.utils.data.DataLoader], **kwargs):
         raise NotImplementedError("If you used test_loop, plz implement first!")
 
-    @abstractmethod
     def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:
-        pass
+        raise NotImplementedError("If you used training_step, plz implement first!")
 
     def step_scheduler(
         self,

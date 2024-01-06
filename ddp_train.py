@@ -540,6 +540,7 @@ def main(hparams: TrainingArguments):
 
     if local_rank == 0:
         web_logger.finish(exit_code=0)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
