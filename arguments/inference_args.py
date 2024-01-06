@@ -13,3 +13,5 @@ class InferenceArguments:
     per_device_test_batch_size: int = 1  # The batch size per GPU/TPU core/CPU for evaluation.
     metric_on_cpu: bool = False  # If you want to run validation_step on cpu -> true
     model_dtype: str = "fp32"
+    feature_column_name: str = "input_ids"
+    labels_column_name: str = "labels"

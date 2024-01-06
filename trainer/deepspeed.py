@@ -16,6 +16,7 @@ class Trainer(metaclass=ABCMeta):
     def __init__(
         self,
         device_id,
+        criterion,
         eval_metric=None,
         precision="fp32",
         cmd_logger=None,
@@ -57,6 +58,7 @@ class Trainer(metaclass=ABCMeta):
         self.device_id = device_id  # it is same rank
         self.device = torch.device("cuda:{}".format(device_id))
 
+        self.criterion = criterion
         self.eval_metric = eval_metric
 
         # in deepspeed, precision is just using model log for .pt file
@@ -109,7 +111,6 @@ class Trainer(metaclass=ABCMeta):
         model,
         optimizer,
         scheduler_cfg: Optional[Mapping],
-        criterion,
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
         trainable_loss=None,
@@ -145,7 +146,6 @@ class Trainer(metaclass=ABCMeta):
                 if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
                     self.should_stop = True
 
-        self.criterion = criterion
         while not self.should_stop:
             train_loader.sampler.set_epoch(self.current_epoch)
             # if you think, each epoch's evaluation step is used another data at each device?

@@ -14,6 +14,7 @@ precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.f
 class Trainer(metaclass=ABCMeta):
     def __init__(
         self,
+        criterion,
         eval_metric=None,
         precision="fp32",
         cmd_logger=None,
@@ -51,6 +52,7 @@ class Trainer(metaclass=ABCMeta):
             non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
         """
         assert precision in ["fp32", "float32"], "cpu mode only support float32 training"
+        self.criterion = criterion
         self.eval_metric = eval_metric
         self.precision = precision_dict["fp32"]
 
@@ -93,7 +95,6 @@ class Trainer(metaclass=ABCMeta):
         model,
         optimizer,
         scheduler_cfg: Optional[Mapping],
-        criterion,
         train_loader: torch.utils.data.DataLoader,
         val_loader: torch.utils.data.DataLoader,
         trainable_loss=None,
@@ -128,7 +129,6 @@ class Trainer(metaclass=ABCMeta):
                 if self.max_epochs is not None and self.current_epoch >= self.max_epochs:
                     self.should_stop = True
 
-        self.criterion = criterion
         while not self.should_stop:
             self.train_loop(
                 state["model"],
@@ -270,6 +270,9 @@ class Trainer(metaclass=ABCMeta):
         limit_batches: Union[int, float] = float("inf"),
     ):
         pass
+
+    def test_loop(self, model, test_loader: Optional[torch.utils.data.DataLoader], **kwargs):
+        raise NotImplementedError("If you used test_loop, plz implement first!")
 
     @abstractmethod
     def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:

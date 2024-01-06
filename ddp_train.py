@@ -44,6 +44,7 @@ class DDPTrainer(Trainer):
     def __init__(
         self,
         device_id,
+        criterion,
         eval_metric,
         precision="fp32",
         cmd_logger=None,
@@ -84,6 +85,7 @@ class DDPTrainer(Trainer):
         """
         super().__init__(
             device_id,
+            criterion,
             eval_metric,
             precision,
             cmd_logger,
@@ -512,6 +514,7 @@ def main(hparams: TrainingArguments):
     eval_metric = None
     trainer = DDPTrainer(
         device_id=local_rank,
+        criterion=criterion,
         eval_metric=eval_metric,
         precision=hparams.model_dtype,
         cmd_logger=logger,
@@ -528,7 +531,6 @@ def main(hparams: TrainingArguments):
     trainer.fit(
         model=ddp_model,
         optimizer=optimizer,
-        criterion=criterion,
         scheduler_cfg=lr_scheduler,
         train_loader=train_dataloader,
         val_loader=eval_dataloader,

@@ -42,6 +42,7 @@ logger.addHandler(timeFileHandler)
 class CPUTrainer(Trainer):
     def __init__(
         self,
+        criterion,
         eval_metric=None,
         precision="fp32",
         cmd_logger=None,
@@ -59,6 +60,7 @@ class CPUTrainer(Trainer):
         log_every_n: int = 1,
     ):
         super().__init__(
+            criterion,
             eval_metric,
             precision,
             cmd_logger,
@@ -397,6 +399,7 @@ def main(hparams: TrainingArguments):
     # TODO(User): input your eval_metric
     eval_metric = None
     trainer = CPUTrainer(
+        criterion=criterion,
         eval_metric=eval_metric,
         precision=hparams.model_dtype,
         cmd_logger=logger,
@@ -411,7 +414,6 @@ def main(hparams: TrainingArguments):
     trainer.fit(
         model=model,
         optimizer=optimizer,
-        criterion=criterion,
         scheduler_cfg=lr_scheduler,
         train_loader=train_dataloader,
         val_loader=eval_dataloader,

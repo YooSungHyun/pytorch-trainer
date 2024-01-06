@@ -31,6 +31,9 @@ from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
 from utils.data.np_dataset import NumpyDataset
 
+# it is only lstm example.
+# torch.backends.cudnn.enabled = False
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s [%(levelname)8s] %(message)s")
@@ -46,6 +49,7 @@ class DSTrainer(Trainer):
     def __init__(
         self,
         device_id,
+        criterion,
         eval_metric=None,
         precision="fp32",
         cmd_logger=None,
@@ -66,6 +70,7 @@ class DSTrainer(Trainer):
     ):
         super().__init__(
             device_id,
+            criterion,
             eval_metric,
             precision,
             cmd_logger,
@@ -491,7 +496,7 @@ def main(hparams: TrainingArguments):
     update_auto_nested_dict(ds_config, "gradient_accumulation_steps", hparams.accumulate_grad_batches)
     if "fp16" in ds_config.keys() and ds_config["fp16"]["enabled"]:
         hparams.model_dtype = "fp16"
-    elif "bfp16" in ds_config.keys() and ds_config["bf16"]["enabled"]:
+    elif "bf16" in ds_config.keys() and ds_config["bf16"]["enabled"]:
         hparams.model_dtype = "bf16"
     else:
         hparams.model_dtype = "fp32"
@@ -559,6 +564,7 @@ def main(hparams: TrainingArguments):
     eval_metric = None
     trainer = DSTrainer(
         device_id=local_rank,
+        criterion=criterion,
         eval_metric=eval_metric,
         precision=hparams.model_dtype,
         cmd_logger=logger,
@@ -575,7 +581,6 @@ def main(hparams: TrainingArguments):
     trainer.fit(
         model=model,
         optimizer=optimizer,
-        criterion=criterion,
         scheduler_cfg=lr_scheduler,
         train_loader=train_dataloader,
         val_loader=eval_dataloader,
