@@ -78,8 +78,7 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [x] Implement customizable training and eval step inheritance
 -   [ ] inference - ipynb, py3
 -   [ ] huggingface - float16 model is real model dtype is float16? check and applied
-    -   [ ] In Huggingface `transformers`, when training a `float16` or `bfloat16` model, it is actually trained by changing the model's `dtype`.
-
+    -   [ ] In Huggingface `transformers`, when training a `float16` or `bfloat16` model, it is actually trained by changing the model's `dtype`,
         so if you want to reproduce this, change it via `model.to(dtype)`.
 # Deepspeed ZeRO Test result (lstm1: n_layer, lstem2: n_layer each 1000)
 
@@ -108,6 +107,7 @@ I think, optim offload is good but, param offload is strange...
 # Infer Result
 >   `distributed learning` will shuffle the data for each GPU <br />
 >   so you won't be able to find the source specified here up to scaler. <br />
+
 | category            | image                                                        |
 | ------------------- | ------------------------------------------------------------ |
 | label               | ![label result warning](./readme_img/kaggle_lstm_result.png) |
