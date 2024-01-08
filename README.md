@@ -1,6 +1,7 @@
 # pytorch-trainer (The best of both worlds, HuggingFace and Torch-Lightning.)
+For each of the CPU, DDP, FSDP, and DS files, we have organized the various examples independently.
 
-torch 2.0 and cpu, ddp, deepspeed trainer template
+Use these examples as a guide to write your own train.py!
 
 I'm thinking of making a template that is somewhat enforced.
 Torch-fabric doesn't support as many features as I thought it would.
