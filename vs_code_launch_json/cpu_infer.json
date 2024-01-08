@@ -2,7 +2,7 @@
     "name": "torch-inference: cpu",
     "type": "python",
     "request": "launch",
-    "program": "cpu_inference.py",
+    "program": "cpu_infer.py",
     "console": "integratedTerminal",
     "justMyCode": false,
     "subProcess": true,
