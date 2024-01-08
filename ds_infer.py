@@ -2,32 +2,30 @@ import logging
 import math
 import os
 from logging import StreamHandler
-from typing import Any
+from typing import Optional, Union
 
+import deepspeed
 import numpy as np
 import pandas as pd
 import torch
-from torch._tensor import Tensor
 import torch.distributed as dist
 from arguments.inference_args import InferenceArguments
 from networks.models import Net
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
 from sklearn.preprocessing import MinMaxScaler
-from utils.comfy import (
-    dataclass_to_namespace,
-    seed_everything,
-    apply_to_collection,
-    tensor_dict_to_device,
-)
+from torch.utils.data import DistributedSampler
+from trainer.deepspeed import Trainer
+from utils.comfy import dataclass_to_namespace, seed_everything, apply_to_collection, tensor_dict_to_device
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
-from torch.utils.data import DistributedSampler
 from utils.data.np_dataset import NumpyDataset
 from torch.cuda.amp import autocast
-from utils.model_checkpointing.common_handler import load_checkpoint
-from torch.nn.parallel import DistributedDataParallel as DDP
-from trainer.ddp import Trainer
+
+from utils.model_checkpointing.ds_handler import load_checkpoint_for_infer
+
+# it is only lstm example.
+torch.backends.cudnn.enabled = False
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -39,40 +37,21 @@ timeFileHandler.setFormatter(formatter)
 logger.addHandler(timeFileHandler)
 
 
-class DDPTrainer(Trainer):
+# TODO(User): override training_step and eval_loop for your style
+class DSTrainer(Trainer):
     def __init__(
-        self, device_id, criterion, eval_metric, precision="fp32", cmd_logger=None, metric_on_cpu: bool = False
-    ) -> None:
-        """Exemplary Trainer with Fabric. This is a very simple trainer focused on readablity but with reduced
-        featureset. As a trainer with more included features, we recommend using the
+        self, device_id, criterion, eval_metric=None, precision="fp32", cmd_logger=None, metric_on_cpu: bool = False
+    ):
+        super().__init__(device_id, criterion, eval_metric, precision, cmd_logger, metric_on_cpu)
+
+    def test_loop(self, model, test_loader: Optional[torch.utils.data.DataLoader], **kwargs):
+        """The test loop ruunning a single test epoch.
 
         Args:
-            precision: fp16, bf16, fp32
+            model: model
+            test_loader: The dataloader yielding the test batches.
 
-            loggers: A single logger or a list of loggers.
-
-            max_epochs: The maximum number of epochs to train
-            max_steps: The maximum number of (optimizer) steps to train
-            grad_accum_steps: How many batches to process before each optimizer step
-            limit_train_batches: Limits the number of train batches per epoch
-                If greater than number of batches in the dataloader, this has no effect.
-            limit_val_batches: Limits the number of test batches per epoch.
-                If greater than number of batches in the dataloader, this has no effect.
-            test_frequency: How many epochs to run before each test epoch.
-            checkpoint_dir: Directory to store checkpoints to.
-            checkpoint_frequency: How many epochs to run before each checkpoint is written.
-            non_blocking: async data transfer cpu to gpu or reverse. (if ddp, true is recommanded)
         """
-        super().__init__(
-            device_id,
-            criterion,
-            eval_metric,
-            precision,
-            cmd_logger,
-            metric_on_cpu,
-        )
-
-    def test_loop(self, model, test_loader, **kwargs):
         # no test if test_loader wasn't passed
         if test_loader is None:
             return
@@ -117,6 +96,9 @@ class DDPTrainer(Trainer):
 
             # TODO(User): fit the input and output for your model architecture!
             with autocast(enabled=self.mixed_precision, dtype=self.precision):
+                # if self.precision == torch.bfloat16:
+                # tensor_dict_to_dtype(batch, self.precision)
+
                 labels = batch.pop("labels")
 
                 outputs = model(**batch)
@@ -196,16 +178,15 @@ class DDPTrainer(Trainer):
                 # so you won't be able to find the source specified here up to scaler.
                 np_outputs = np.concatenate([pred, labels_gathered_data.cpu().numpy()], axis=1)
                 pd_result = pd.DataFrame(np_outputs, columns=["pred", "labels"])
-                pd_result.to_excel("./ddp_result.xlsx", index=False)
+                pd_result.to_excel("./ds_result.xlsx", index=False)
 
         on_test_epoch_end(tot_batch_logits, tot_batch_labels, metric_on_device, **kwargs)
 
 
 def main(hparams: InferenceArguments):
     # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
-    setproctitle("ddp_inference")
+    setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
     seed_everything(hparams.seed)
-    dist.init_process_group("nccl")
     world_size = int(os.environ.get("WORLD_SIZE", -1))
     rank = int(os.environ.get("RANK", -1))
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -217,6 +198,8 @@ def main(hparams: InferenceArguments):
     assert world_size > -1 and rank > -1 and local_rank > -1, "Your distributed environ is wrong, plz check and retry!"
 
     torch.cuda.set_device(local_rank)
+    deepspeed.init_distributed("nccl", rank=rank, world_size=world_size)
+
     # I'm not saved MinMaxScaler, so, have to re-calculate, stupid thing...🤣
     df_train = pd.read_csv("./raw_data/LSTM-Multivariate_pollution.csv", header=0, encoding="utf-8")
     # Kaggle author Test Final RMSE: 0.06539
@@ -247,8 +230,6 @@ def main(hparams: InferenceArguments):
     # Scale the selected columns to the range 0-1
     df_train_scaled[columns] = scaler.fit_transform(df_train_scaled[columns])
     df_test_scaled[columns] = scaler.transform(df_test_scaled[columns])
-
-    # we don't need to df_train_scaled anymore
 
     # Show the scaled data
     logger.info(df_test_scaled.head())
@@ -289,9 +270,10 @@ def main(hparams: InferenceArguments):
             model_input_name=test_dataset.length_column_name,
         )
     else:
-        # DistributedSampler's shuffle: each device get random indices data segment in every epoch
         custom_test_sampler = DistributedSampler(test_dataset, seed=hparams.seed, rank=rank, shuffle=False)
 
+    # DataLoader's shuffle: one device get random indices dataset in every epoch
+    # example np_dataset is already set (feature)7:1(label), so, it can be all shuffle `True` between sampler and dataloader
     test_dataloader = CustomDataLoader(
         dataset=test_dataset,
         feature_column_name=hparams.feature_column_name,
@@ -299,19 +281,49 @@ def main(hparams: InferenceArguments):
         batch_size=hparams.per_device_test_batch_size,
         sampler=custom_test_sampler,
         num_workers=hparams.num_workers,
-        drop_last=False,
+        drop_last=hparams.dataloader_drop_last,
         pin_memory=True,
         persistent_workers=True,
     )
 
+    # Instantiate objects
     model = Net().cuda(local_rank)
-    ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    state = {"model": ddp_model}
-    load_checkpoint(state, hparams.model_path)
+    state = {"model": model}
+    load_checkpoint_for_infer(
+        state,
+        checkpoint_filepath=hparams.model_path,
+        model_file_name="mp_rank_00_model_states.pt",
+        device=f"cuda:{local_rank}",
+        logger=logger,
+    )
+    # Since the deepspeed lr scheduler is, after all, just a generic object-inherited custom scheduler, Only authorize the use of torch scheduler.
+    # Also, the ZeroOptimizer.param_groups address is the same as the torch scheduler.optimizer.param_groups address.
+    # Therefore, there is absolutely no reason to use the lr_scheduler provided by Deepspeed.
+
+    # in deepspeed, precision is just using model log for .pt file
+    precision_dict = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+    precision = torch.float32
+    if precision in ["fp16", "float16"]:
+        precision = precision_dict["fp16"]
+    elif precision in ["bf16" or "bfloat16"]:
+        precision = precision_dict["bf16"]
+
+    model = deepspeed.init_inference(
+        model=state["model"],
+        mp_size=world_size,
+        dtype=precision,
+        injection_policy={Net: ("fc")},
+        replace_with_kernel_inject=False,
+    )
+
+    # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
     eval_metric = None
     criterion = torch.nn.MSELoss()
-    trainer = DDPTrainer(
+
+    # TODO(User): input your eval_metric
+    eval_metric = None
+    trainer = DSTrainer(
         device_id=local_rank,
         criterion=criterion,
         eval_metric=eval_metric,
@@ -319,14 +331,16 @@ def main(hparams: InferenceArguments):
         cmd_logger=logger,
         metric_on_cpu=hparams.metric_on_cpu,
     )
-    trainer.test_loop(model=ddp_model, test_loader=test_dataloader)
 
-    dist.destroy_process_group()
+    trainer.test_loop(model=model, test_loader=test_dataloader)
 
 
 if __name__ == "__main__":
+    assert torch.distributed.is_available(), "DDP is only multi gpu!! check plz!"
+    assert torch.cuda.is_available(), "CPU training is not allowed."
     parser = ArgumentParser()
     parser.add_arguments(InferenceArguments, dest="training_args")
+    parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     args = dataclass_to_namespace(args, "training_args")
 

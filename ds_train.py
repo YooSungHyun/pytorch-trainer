@@ -157,13 +157,13 @@ class DSTrainer(Trainer):
         if val_loader is None:
             return
 
-        def on_validation_model_eval(model):
+        def on_start_eval(model):
             model.eval()
             # requires_grad = True, but loss.backward() raised error
             # because grad_fn is None
             torch.set_grad_enabled(False)
 
-        on_validation_model_eval(model)
+        on_start_eval(model)
 
         def on_validation_epoch_start():
             pass
@@ -181,7 +181,7 @@ class DSTrainer(Trainer):
         if self.metric_on_cpu:
             metric_on_device = torch.device("cpu")
         else:
-            metric_on_device = model.device
+            metric_on_device = self.device
 
         for batch_idx, batch in pbar:
             # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,

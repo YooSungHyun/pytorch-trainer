@@ -76,7 +76,7 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [x] fsdp_trainer - test (wandb compare this [link](https://medium.com/nlplanet/bert-finetuning-with-hugging-face-and-training-visualizations-with-tensorboard-46368a57fc97))
 -   [x] eval epoch end all_gather on cpu, eval on cpu (?)
 -   [x] Implement customizable training and eval step inheritance
--   [ ] inference - ipynb, py3
+-   [x] inference - py3
 -   [x] huggingface - float16 model is real model dtype is float16? check and applied
     -   [x] In Huggingface `transformers`, when training a `float16` or `bfloat16` model, it is actually trained by changing the model's `dtype`,
         so if you want to reproduce this, change it via `model.to(dtype)`.
@@ -114,6 +114,7 @@ I think, optim offload is good but, param offload is strange...
 | label               | ![label result warning](./readme_img/kaggle_lstm_result.png) |
 | CPU                 | ![cpu result warning](./readme_img/cpu_infer_result.png)     |
 | DDP                 | ![ddp result warning](./readme_img/ddp_infer_result.png)     |
+| DeepSpeed           | ![ds result warning](./readme_img/ds_infer_result.png)       |
 
 **IMDB (Binary Classification) Task**
 | category            | image                                                        |

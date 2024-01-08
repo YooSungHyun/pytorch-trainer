@@ -56,48 +56,9 @@ SHARDING_STRATEGY = {
 # TODO(User): override training_step and eval_loop for your style
 class FSDPTrainer(Trainer):
     def __init__(
-        self,
-        device_id,
-        criterion,
-        eval_metric,
-        precision: str = "fp32",
-        cmd_logger=None,
-        web_logger=None,
-        max_epochs: Optional[int] = 1000,
-        max_steps: Optional[int] = None,
-        grad_accum_steps: int = 1,
-        limit_train_batches: Union[int, float] = float("inf"),
-        limit_val_batches: Union[int, float] = float("inf"),
-        test_frequency: int = 1,
-        checkpoint_dir: str = "./checkpoints",
-        checkpoint_frequency: int = 1,
-        chk_addr_dict: dict = None,
-        non_blocking: bool = True,
-        log_every_n: int = 1,
-        max_norm: float = 0.0,
-        metric_on_cpu: bool = False,
+        self, device_id, criterion, eval_metric, precision: str = "fp32", cmd_logger=None, metric_on_cpu: bool = False
     ):
-        super().__init__(
-            device_id,
-            criterion,
-            eval_metric,
-            precision,
-            cmd_logger,
-            web_logger,
-            max_epochs,
-            max_steps,
-            grad_accum_steps,
-            limit_train_batches,
-            limit_val_batches,
-            test_frequency,
-            checkpoint_dir,
-            checkpoint_frequency,
-            chk_addr_dict,
-            non_blocking,
-            log_every_n,
-            max_norm,
-            metric_on_cpu,
-        )
+        super().__init__(device_id, criterion, eval_metric, precision, cmd_logger, metric_on_cpu)
 
     def test_loop(
         self,
@@ -118,13 +79,13 @@ class FSDPTrainer(Trainer):
         if test_loader is None:
             return
 
-        def on_test_model_eval(model):
+        def on_start_test(model):
             model.eval()
             # requires_grad = True, but loss.backward() raised error
             # because grad_fn is None
             torch.set_grad_enabled(False)
 
-        on_test_model_eval(model)
+        on_start_test(model)
 
         def on_test_epoch_start():
             pass
@@ -143,7 +104,7 @@ class FSDPTrainer(Trainer):
         if self.metric_on_cpu:
             metric_on_device = torch.device("cpu")
         else:
-            metric_on_device = model.device
+            metric_on_device = self.device
 
         for batch_idx, batch in pbar:
             # I tried to output the most accurate LOSS to WANDB with ALL_GATHER for all LOSS sections,

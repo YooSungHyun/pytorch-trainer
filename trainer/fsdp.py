@@ -310,7 +310,7 @@ class Trainer(metaclass=ABCMeta):
             batch_idx: index of the current batch w.r.t the current epoch
 
         """
-        raise NotImplementedError("If you used eval_loop, plz implement first!")
+        raise NotImplementedError("If you used training_step, plz implement first!")
 
     def eval_loop(
         self,
@@ -339,7 +339,7 @@ class Trainer(metaclass=ABCMeta):
                 If greater than the number of batches in the ``val_loader``, this has no effect.
 
         """
-        raise NotImplementedError("If you used eval_loop, plz implement first!")
+        raise NotImplementedError("If you used test_loop, plz implement first!")
 
     def step_scheduler(
         self,

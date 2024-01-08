@@ -141,13 +141,13 @@ class CPUTrainer(Trainer):
         if val_loader is None:
             return
 
-        def on_validation_model_eval(model):
+        def on_start_eval(model):
             model.eval()
             # requires_grad = True, but loss.backward() raised error
             # because grad_fn is None
             torch.set_grad_enabled(False)
 
-        on_validation_model_eval(model)
+        on_start_eval(model)
 
         def on_validation_epoch_start():
             pass
