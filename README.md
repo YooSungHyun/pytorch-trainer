@@ -53,7 +53,8 @@ In `vs_code_launch_json`, upload `launch.json` for debugging vscode.
      -   `monitor` is for only `ReduceLROnPlateau`'s loss value
 8.   run! `cd {your-workpsace}/pytorch-trainer` & `sh scripts/run_train_[cpu|ddp|deepseed].sh`
 
-# TODO LIST
+<details>
+<summary># TODO LIST Open/Close</summary>
 
 each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspace=user-bart_tadev)
 
@@ -80,6 +81,7 @@ each test wandb is here [Link](https://wandb.ai/bart_tadev/torch-trainer?workspa
 -   [x] huggingface - float16 model is real model dtype is float16? check and applied
     -   [x] In Huggingface `transformers`, when training a `float16` or `bfloat16` model, it is actually trained by changing the model's `dtype`,
         so if you want to reproduce this, change it via `model.to(dtype)`.
+</details>
 # Deepspeed ZeRO Test result (lstm1: n_layer, lstem2: n_layer each 1000)
 
 The `ZeRO` test is not accurate because the model was run with an lstm.
