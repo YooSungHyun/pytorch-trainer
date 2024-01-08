@@ -300,7 +300,6 @@ class Trainer(metaclass=ABCMeta):
 
         on_train_epoch_end()
 
-    @abstractmethod
     def training_step(self, model, batch: Any, batch_idx: int) -> torch.Tensor:
         """A single training step, running forward and backward. The optimizer step is called separately, as this is
         given as a closure to the optimizer step.
@@ -311,9 +310,8 @@ class Trainer(metaclass=ABCMeta):
             batch_idx: index of the current batch w.r.t the current epoch
 
         """
-        pass
+        raise NotImplementedError("If you used eval_loop, plz implement first!")
 
-    @abstractmethod
     def eval_loop(
         self,
         model,
@@ -329,7 +327,19 @@ class Trainer(metaclass=ABCMeta):
                 If greater than the number of batches in the ``val_loader``, this has no effect.
 
         """
-        pass
+        raise NotImplementedError("If you used eval_loop, plz implement first!")
+
+    def test_loop(self, model, test_loader: Optional[torch.utils.data.DataLoader], **kwargs):
+        """The validation loop ruunning a single validation epoch.
+
+        Args:
+            model: model
+            val_loader: The dataloader yielding the validation batches.
+            limit_batches: Limits the batches during this validation epoch.
+                If greater than the number of batches in the ``val_loader``, this has no effect.
+
+        """
+        raise NotImplementedError("If you used eval_loop, plz implement first!")
 
     def step_scheduler(
         self,

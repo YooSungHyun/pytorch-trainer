@@ -312,8 +312,10 @@ def main(hparams: TrainingArguments):
         weight_decay=hparams.weight_decay,
     )
 
-    generator = torch.Generator()
-    generator.manual_seed(hparams.seed)
+    generator = None
+    if hparams.sampler_shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(hparams.seed)
     if hparams.group_by_length:
         custom_train_sampler = LengthGroupedSampler(
             batch_size=hparams.per_device_train_batch_size,
@@ -325,7 +327,6 @@ def main(hparams: TrainingArguments):
             batch_size=hparams.per_device_eval_batch_size,
             dataset=eval_dataset,
             model_input_name=eval_dataset.length_column_name,
-            generator=generator,
         )
     else:
         # custom_train_sampler = SequentialSampler(train_dataset)

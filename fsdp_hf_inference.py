@@ -10,23 +10,18 @@ import evaluate
 import torch
 import torch.distributed as dist
 import wandb
-from arguments.training_args import TrainingArguments
+from arguments.inference_args import InferenceArguments
 from datasets import Dataset, concatenate_datasets, load_dataset
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
 from torch.cuda.amp import autocast
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointImpl,
-    apply_activation_checkpointing,
-    checkpoint_wrapper,
-)
 from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.utils.data import DistributedSampler
 from trainer.fsdp import Trainer
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from transformers.models.roberta.modeling_roberta import RobertaEncoder
+from transformers import AutoTokenizer, AutoConfig
+from transformers.models.roberta.modeling_roberta import RobertaForSequenceClassification, RobertaEncoder
 from utils.comfy import (
     apply_to_collection,
     bfloat_support,
@@ -34,11 +29,11 @@ from utils.comfy import (
     json_to_dict,
     seed_everything,
     tensor_dict_to_device,
-    web_log_every_n,
 )
 from utils.data.custom_sampler import DistributedLengthGroupedSampler
 from utils.FSDP import mixed_precision
 from utils.FSDP.wrapping import get_transformers_wrapper
+from utils.model_checkpointing.fsdp_handler import load_model_checkpoint
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -73,7 +68,7 @@ class FSDPTrainer(Trainer):
         grad_accum_steps: int = 1,
         limit_train_batches: Union[int, float] = float("inf"),
         limit_val_batches: Union[int, float] = float("inf"),
-        validation_frequency: int = 1,
+        test_frequency: int = 1,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_frequency: int = 1,
         chk_addr_dict: dict = None,
@@ -94,7 +89,7 @@ class FSDPTrainer(Trainer):
             grad_accum_steps,
             limit_train_batches,
             limit_val_batches,
-            validation_frequency,
+            test_frequency,
             checkpoint_dir,
             checkpoint_frequency,
             chk_addr_dict,
@@ -104,77 +99,41 @@ class FSDPTrainer(Trainer):
             metric_on_cpu,
         )
 
-    def training_step(self, model, batch, batch_idx):
-        # TODO(User): fit the input and output for your model architecture!
-        with autocast(enabled=self.mixed_precision, dtype=self.precision):
-            output = model(**batch)
-            loss = output["loss"]
-
-        def on_before_backward(loss):
-            pass
-
-        on_before_backward(loss)
-
-        self.grad_scaler.scale(loss).backward()
-
-        def on_after_backward():
-            pass
-
-        on_after_backward()
-
-        log_output = {"loss": loss}
-        # avoid gradients in stored/accumulated values -> prevents potential OOM
-        self._current_train_return = apply_to_collection(log_output, dtype=torch.Tensor, function=lambda x: x.detach())
-
-        web_log_every_n(
-            self.web_logger,
-            {
-                "train/loss": self._current_train_return["loss"],
-                "train/step": self.step,
-                "train/global_step": self.global_step,
-                "train/epoch": self.current_epoch,
-            },
-            self.step,
-            self.log_every_n,
-            self.device_id,
-        )
-        return loss
-
-    def eval_loop(
+    def test_loop(
         self,
         model,
-        val_loader: Optional[torch.utils.data.DataLoader],
-        limit_batches: Union[int, float] = float("inf"),
+        test_loader: Optional[torch.utils.data.DataLoader],
+        **kwargs,
     ):
-        """The validation loop ruunning a single validation epoch.
+        """The test loop ruunning a single test epoch.
 
         Args:
             model: model
-            val_loader: The dataloader yielding the validation batches.
-            limit_batches: Limits the batches during this validation epoch.
-                If greater than the number of batches in the ``val_loader``, this has no effect.
+            test_loader: The dataloader yielding the test batches.
+            limit_batches: Limits the batches during this test epoch.
+                If greater than the number of batches in the ``test_loader``, this has no effect.
 
         """
-        # no validation if val_loader wasn't passed
-        if val_loader is None:
+        # no test if test_loader wasn't passed
+        if test_loader is None:
             return
 
-        def on_validation_model_eval(model):
+        def on_test_model_eval(model):
             model.eval()
             # requires_grad = True, but loss.backward() raised error
             # because grad_fn is None
             torch.set_grad_enabled(False)
 
-        on_validation_model_eval(model)
+        on_test_model_eval(model)
 
-        def on_validation_epoch_start():
+        def on_test_epoch_start():
             pass
 
         if self.device_id == 0:
-            iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
+            iterable = self.progbar_wrapper(test_loader, total=len(test_loader), desc="test")
             pbar = enumerate(iterable)
         else:
-            pbar = enumerate(val_loader)
+            pbar = enumerate(test_loader)
 
         eval_step = 0
         tot_batch_logits = list()
@@ -193,14 +152,10 @@ class FSDPTrainer(Trainer):
             tensor_dict_to_device(batch, self.device, non_blocking=self.non_blocking)
             # I use distributed dataloader and wandb log only rank:0, and epoch loss all gather
 
-            # end epoch if stopping training completely or max batches for this epoch reached
-            if self.should_stop or batch_idx >= limit_batches:
-                break
-
-            def on_validation_batch_start(batch, batch_idx):
+            def on_test_batch_start(batch, batch_idx):
                 pass
 
-            on_validation_batch_start(batch, batch_idx)
+            on_test_batch_start(batch, batch_idx)
 
             # TODO(User): fit the input and output for your model architecture!
             # Model is float32 but can calculate fp16 safety!
@@ -219,32 +174,22 @@ class FSDPTrainer(Trainer):
             tot_batch_labels.append(batch["labels"].to(metric_on_device))
             tot_batch_loss.append(loss.to(metric_on_device))
 
-            def on_validation_batch_end(eval_out, batch, batch_idx):
+            def on_test_batch_end(eval_out, batch, batch_idx):
                 pass
 
-            on_validation_batch_end(self._current_val_return, batch, batch_idx)
+            on_test_batch_end(self._current_val_return, batch, batch_idx)
 
-            web_log_every_n(
-                self.web_logger,
-                {
-                    "eval_step/loss": self._current_val_return["loss"],
-                    "eval_step/step": eval_step,
-                    "eval_step/global_step": self.global_step,
-                    "eval_step/epoch": self.current_epoch,
-                },
-                eval_step,
-                self.log_every_n,
-                self.device_id,
-            )
             cmd_output = {"loss": self._current_val_return["loss"]}
             if self.device_id == 0:
                 self._format_iterable(iterable, cmd_output, "val")
             eval_step += 1
 
-        device_total_loss = torch.mean(torch.tensor(tot_batch_loss, dtype=loss.dtype, device=metric_on_device))
+        device_total_loss = torch.mean(
+            torch.tensor(tot_batch_loss, dtype=tot_batch_loss[0].dtype, device=metric_on_device)
+        )
 
         # TODO(User): Create any form you want to output to wandb!
-        def on_validation_epoch_end(tot_batch_logits, tot_batch_labels, device_total_loss, metric_device):
+        def on_test_epoch_end(tot_batch_logits, tot_batch_labels, device_total_loss, metric_device):
             tot_batch_logits = torch.cat(tot_batch_logits, dim=0)
             tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
 
@@ -286,33 +231,24 @@ class FSDPTrainer(Trainer):
                 dist.all_gather(logits_gathered_data, tot_batch_logits)
                 dist.all_gather(labels_gathered_data, tot_batch_labels)
 
-            # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
-            logits_gathered_data = torch.cat(logits_gathered_data, dim=0)
-            predictions = torch.argmax(logits_gathered_data, axis=-1)
-            references = torch.cat(labels_gathered_data, dim=0)
+            if self.device_id == 0:
+                # example 4 gpus : [gpu0[tensor],gpu1[tensor],gpu2[tensor],gpu3[tensor]]
+                logits_gathered_data = torch.cat(logits_gathered_data, dim=0)
+                predictions = torch.argmax(logits_gathered_data, axis=-1)
+                references = torch.cat(labels_gathered_data, dim=0)
 
-            total_acc = self.eval_metric.compute(predictions=predictions, references=references)
-            # epoch monitoring is must doing every epoch
-            web_log_every_n(
-                self.web_logger,
-                {"eval/loss": total_loss, "eval/acc": total_acc, "eval/epoch": self.current_epoch},
-                self.current_epoch,
-                1,
-                self.device_id,
-            )
+                total_acc = self.eval_metric.compute(predictions=predictions, references=references)
 
-        on_validation_epoch_end(tot_batch_logits, tot_batch_labels, device_total_loss, metric_on_device)
+                self.logger.info(f"Total Loss: {total_loss}")
+                self.logger.info(f"Total Metric: {total_acc}")
 
-        def on_validation_model_train(model):
-            torch.set_grad_enabled(True)
-            model.train()
-
-        on_validation_model_train(model)
+        on_test_epoch_end(tot_batch_logits, tot_batch_labels, device_total_loss, metric_on_device)
 
 
-def main(hparams: TrainingArguments):
+def main(hparams: InferenceArguments):
     # reference: https://github.com/pytorch/examples/blob/main/distributed/FSDP/T5_training.py
-    setproctitle(os.environ.get("WANDB_PROJECT", "torch-trainer"))
+    setproctitle("fsdp_HF_infer")
+    seed_everything(hparams.seed)
     seed_everything(hparams.seed)
     dist.init_process_group("nccl")
     world_size = int(os.environ.get("WORLD_SIZE", -1))
@@ -326,6 +262,13 @@ def main(hparams: TrainingArguments):
     assert world_size > -1 and rank > -1 and local_rank > -1, "Your distributed environ is wrong, plz check and retry!"
 
     torch.cuda.set_device(local_rank)
+
+    config = AutoConfig.from_pretrained(hparams.transformers_model_name)
+    config.num_labels = 2
+    tokenizer = AutoTokenizer.from_pretrained(hparams.transformers_model_name)
+    model = RobertaForSequenceClassification(config)
+
+    load_model_checkpoint(model, local_rank, hparams.model_path, logger)
 
     fsdp_config = json_to_dict(hparams.fsdp_config)
     if hparams.model_dtype:
@@ -352,14 +295,7 @@ def main(hparams: TrainingArguments):
     # TODO(User): you have to input your fsdp model layer
     wrapping_policy = get_transformers_wrapper(RobertaEncoder)
 
-    web_logger = None
-    if local_rank == 0:
-        web_logger = wandb.init(config=hparams)
-
-    model = AutoModelForSequenceClassification.from_pretrained(hparams.transformers_model_name, num_labels=2)
-    tokenizer = AutoTokenizer.from_pretrained(hparams.transformers_model_name)
-
-    imdb = load_dataset("imdb")
+    imdb = load_dataset(hparams.data_path)
 
     def preprocess(examples):
         tokenized_text = tokenizer(examples["text"], return_token_type_ids=False, return_tensors="pt")
@@ -383,50 +319,31 @@ def main(hparams: TrainingArguments):
         assert len(result) % 2 == 0, "`split=all` sampling error check plz"
         return result
 
-    train_dataset = imdb["train"].map(preprocess, remove_columns=imdb["train"].column_names)
-    train_dataset = filter_and_min_sample(train_dataset, tokenizer.model_max_length)
-    eval_dataset = imdb["test"].map(preprocess, remove_columns=imdb["test"].column_names)
-    eval_dataset = filter_and_min_sample(eval_dataset, tokenizer.model_max_length)
+    test_dataset = imdb["test"].map(preprocess, remove_columns=imdb["test"].column_names)
+    test_dataset = filter_and_min_sample(test_dataset, tokenizer.model_max_length)
 
     from transformers import DataCollatorWithPadding
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
-    if local_rank == 0:
-        web_logger.watch(model, log_freq=hparams.log_every_n)
 
     if hparams.group_by_length:
         # TODO(User): model_input_name is changed by your dataset's lengths column!
-        custom_train_sampler = DistributedLengthGroupedSampler(
-            batch_size=hparams.per_device_train_batch_size,
-            dataset=train_dataset,
-            rank=rank,
-            seed=hparams.seed,
-            shuffle=hparams.sampler_shuffle,
-            model_input_name="input_ids",
-        )
-        custom_eval_sampler = DistributedLengthGroupedSampler(
-            batch_size=hparams.per_device_eval_batch_size,
-            dataset=eval_dataset,
+        custom_test_sampler = DistributedLengthGroupedSampler(
+            batch_size=hparams.per_device_test_batch_size,
+            dataset=test_dataset,
             rank=rank,
             seed=hparams.seed,
             shuffle=False,
             model_input_name="input_ids",
         )
     else:
-        # DistributedSampler's shuffle: each device get random indices data segment in every epoch
-        custom_train_sampler = DistributedSampler(
-            train_dataset, seed=hparams.seed, rank=rank, shuffle=hparams.sampler_shuffle
-        )
-        custom_eval_sampler = DistributedSampler(eval_dataset, seed=hparams.seed, rank=rank, shuffle=False)
+        custom_test_sampler = DistributedSampler(test_dataset, seed=hparams.seed, rank=rank, shuffle=False)
 
-    train_kwargs = {"batch_size": hparams.per_device_train_batch_size, "sampler": custom_train_sampler}
-    test_kwargs = {"batch_size": hparams.per_device_eval_batch_size, "sampler": custom_eval_sampler}
+    test_kwargs = {"batch_size": hparams.per_device_test_batch_size, "sampler": custom_test_sampler}
     cuda_kwargs = {"num_workers": hparams.num_workers, "pin_memory": True, "shuffle": False}
-    train_kwargs.update(cuda_kwargs)
     test_kwargs.update(cuda_kwargs)
 
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, collate_fn=data_collator, **train_kwargs)
-    eval_dataloader = torch.utils.data.DataLoader(eval_dataset, collate_fn=data_collator, **test_kwargs)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, collate_fn=data_collator, **test_kwargs)
 
     fsdp_model = FSDP(
         model,
@@ -438,130 +355,21 @@ def main(hparams: TrainingArguments):
         cpu_offload=CPUOffload(offload_params=fsdp_config["offload_params"]),
     )
 
-    # optimizer have to initialize after FSDP
-    optimizer = torch.optim.AdamW(
-        fsdp_model.parameters(),
-        lr=hparams.learning_rate,
-        eps=hparams.optim_eps,
-        betas=(hparams.optim_beta1, hparams.optim_beta2),
-        weight_decay=hparams.weight_decay,
-    )
-
-    if fsdp_config["fsdp_activation_checkpointing"]:
-        non_reentrant_wrapper = partial(
-            checkpoint_wrapper,
-            offload_to_cpu=fsdp_config["offload_params"],
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-        )
-        # apply activation checkpointing to model returns None as model is updated directly
-        # TODO(User): Input your fsdp model layer in check_fn!
-        apply_activation_checkpointing(
-            fsdp_model,
-            checkpoint_wrapper_fn=non_reentrant_wrapper,
-            check_fn=lambda submodule: isinstance(submodule, RobertaEncoder),
-        )
-
-        def is_forward_signature_columns(module, key):
-            # Inspect model forward signature to keep only the arguments it accepts.
-            signature = inspect.signature(module.forward)
-            input_columns = list(signature.parameters.keys())
-            return key in input_columns
-
-        def remove_columns(module, args, kwargs):
-            for key in list(kwargs.keys()):
-                if not is_forward_signature_columns(module, key):
-                    kwargs.pop(key)
-            return (args, kwargs)
-
-        """ TODO(User): check your model architecture, and change this line
-            When using activation_checkpointing in the FSDP module, we found that the transformers model input kwargs contained unnecessary keys (ex. `offload_to_cpu`),
-            so we used a hook in nn.module to force the values to be cleaned up before input.
-            Since the structure of your model and the section to be checkpointed may be different, please check and modify it before using it.
-        """
-        fsdp_model.roberta.encoder._fsdp_wrapped_module._checkpoint_wrapped_module.register_forward_pre_hook(
-            remove_columns, with_kwargs=True
-        )
-        # for i in range(len(fsdp_model.decoder.block)):
-        #     fsdp_model.decoder.block[i]._fsdp_wrapped_module._checkpoint_wrapped_module.register_forward_pre_hook(
-        #         remove_columns, with_kwargs=True
-        #     )
-
-    # dataloader already calculate len(total_data) / (batch_size * dist.get_world_size())
-    # accumulation is always floor
-    steps_per_epoch = math.floor(len(train_dataloader) / hparams.accumulate_grad_batches)
-
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=hparams.learning_rate,
-        pct_start=hparams.warmup_ratio,
-        epochs=hparams.max_epochs,
-        final_div_factor=hparams.final_div_factor,
-        steps_per_epoch=steps_per_epoch,
-    )
-
-    # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
-    lr_scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}
-    assert id(scheduler) == id(lr_scheduler["scheduler"])
-
-    # this example is not needs criterion and trainable_loss
-    criterion = None
-    trainable_loss = None
-
-    # I think some addr is same into trainer init&fit respectfully
-    chk_addr_dict = {
-        "train_dataloader": id(train_dataloader),
-        "eval_dataloader": id(eval_dataloader),
-        "model": id(model),
-        "optimizer": id(optimizer),
-        "criterion": id(criterion),
-        "scheduler_cfg": id(lr_scheduler),
-        "scheduler_cfg[scheduler]": id(lr_scheduler["scheduler"]),
-        "trainable_loss": id(trainable_loss),
-    }
-
-    log_str = f"""\n##########################################
-    train_dataloader addr: {chk_addr_dict["train_dataloader"]}
-    eval_dataloader addr: {chk_addr_dict["eval_dataloader"]}
-    model addr: {chk_addr_dict["model"]}
-    optimizer addr: {chk_addr_dict["optimizer"]}
-    criterion addr: {chk_addr_dict["criterion"]}
-    scheduler_cfg addr: {chk_addr_dict["scheduler_cfg"]}
-    scheduler addr: {chk_addr_dict["scheduler_cfg[scheduler]"]}
-    ##########################################
-    """
-    logger.debug(log_str)
     # TODO(User): input your eval_metric
     eval_metric = evaluate.load("accuracy")
     trainer = FSDPTrainer(
         device_id=local_rank,
-        criterion=criterion,
+        criterion=None,
         eval_metric=eval_metric,
         precision=hparams.model_dtype,
         cmd_logger=logger,
-        web_logger=web_logger,
-        max_epochs=hparams.max_epochs,
+        max_epochs=1,
         grad_accum_steps=hparams.accumulate_grad_batches,
-        chk_addr_dict=chk_addr_dict,
-        checkpoint_dir=hparams.output_dir,
-        log_every_n=hparams.log_every_n,
-        max_norm=hparams.max_norm,
         metric_on_cpu=hparams.metric_on_cpu,
     )
 
-    trainer.fit(
-        model=fsdp_model,
-        optimizer=optimizer,
-        scheduler_cfg=lr_scheduler,
-        train_loader=train_dataloader,
-        val_loader=eval_dataloader,
-        ckpt_path=hparams.output_dir,
-        trainable_loss=trainable_loss,
-    )
+    trainer.test_loop(model=fsdp_model, test_loader=test_dataloader)
 
-    from utils.model_checkpointing.fsdp_handler import save_model_checkpoint
-
-    if local_rank == 0:
-        web_logger.finish(exit_code=0)
     dist.destroy_process_group()
 
 
@@ -569,7 +377,7 @@ if __name__ == "__main__":
     assert torch.distributed.is_available(), "DDP is only multi gpu!! check plz!"
     assert torch.cuda.is_available(), "CPU training is not allowed."
     parser = ArgumentParser()
-    parser.add_arguments(TrainingArguments, dest="training_args")
+    parser.add_arguments(InferenceArguments, dest="training_args")
     args = parser.parse_args()
     args = dataclass_to_namespace(args, "training_args")
 

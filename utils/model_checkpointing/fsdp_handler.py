@@ -22,48 +22,51 @@ def save_model_checkpoint(model, rank, checkpoint_folder, logger=None):
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fullstate_save_policy):
         cpu_state = model.state_dict()
 
-    logger.info(f"saving process: rank {rank}  done w model state_dict\n")
+    if logger:
+        logger.info(f"saving process: rank {rank}  done w model state_dict\n")
 
     if rank == 0:
-        logger.info("--> saving model ...")
+        if logger:
+            logger.info("--> saving model ...")
         # create save path
         save_full_path = os.path.join(checkpoint_folder, "total_model.pt")
 
         # save model
         torch.save(cpu_state, save_full_path)
 
-        logger.info(f"train end & model checkpoint saved at {save_full_path}\n")
+        if logger:
+            logger.info(f"train end & model checkpoint saved at {save_full_path}\n")
 
 
 def load_model_checkpoint(model, rank, checkpoint_filepath, logger=None):
-    """load local checkpoint to rank0 cpu
-    must be called * before * passing to FSDP"""
-
-    if rank != 0:
-        return
-
     # where is the checkpoint at...
     full_state_dict_model_path = Path(checkpoint_filepath)
     # is it present...
     if not full_state_dict_model_path.is_file():
-        print(f"model checkpoint {full_state_dict_model_path} not present. Returning...")
+        if logger:
+            logger.info(f"model checkpoint {full_state_dict_model_path} not present. Returning...")
+        else:
+            print(f"model checkpoint {full_state_dict_model_path} not present. Returning...")
         return
 
     model_checkpoint = torch.load(full_state_dict_model_path)
     # integrate into loaded model
     model.load_state_dict(model_checkpoint)
 
-    logger.info("model checkpoint loaded to rank0 cpu")
+    if logger:
+        logger.info(f"model checkpoint loaded to rank:{rank} {model.device.type}")
 
 
 def load_distributed_model_checkpoint(model, rank, checkpoint_folder, logger=None):
-    logger.info(f"loading distributed checkpoint, rank {rank}...")
+    if logger:
+        logger.info(f"loading distributed checkpoint, rank {rank}...")
 
     checkdir = Path(checkpoint_folder)
 
     if not checkdir.exists():
         if rank == 0:
-            logger.info("No checkpoint directory found...skipping")
+            if logger:
+                logger.info("No checkpoint directory found...skipping")
         return
 
     reader = FileSystemReader(checkdir)
@@ -73,7 +76,8 @@ def load_distributed_model_checkpoint(model, rank, checkpoint_folder, logger=Non
         load_state_dict(state_dict, reader)
         model.load_state_dict(state_dict)
 
-    logger.info(f"--> local state loaded on rank {rank}")
+    if logger:
+        logger.info(f"--> local state loaded on rank {rank}")
 
     return
 

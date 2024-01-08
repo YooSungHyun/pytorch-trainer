@@ -285,6 +285,7 @@ def main(hparams: InferenceArguments):
             dataset=test_dataset,
             rank=rank,
             seed=hparams.seed,
+            shuffle=False,
             model_input_name=test_dataset.length_column_name,
         )
     else:

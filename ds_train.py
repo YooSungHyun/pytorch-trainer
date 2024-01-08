@@ -403,6 +403,7 @@ def main(hparams: TrainingArguments):
             dataset=train_dataset,
             rank=rank,
             seed=hparams.seed,
+            shuffle=hparams.sampler_shuffle,
             model_input_name=train_dataset.length_column_name,
         )
         custom_eval_sampler = DistributedLengthGroupedSampler(
@@ -410,6 +411,7 @@ def main(hparams: TrainingArguments):
             dataset=eval_dataset,
             rank=rank,
             seed=hparams.seed,
+            shuffle=False,
             model_input_name=eval_dataset.length_column_name,
         )
     else:
